@@ -21,6 +21,8 @@ from typing import List, Dict, Optional
 import torch
 import time
 import uuid
+import db
+from contextlib import asynccontextmanager
 
 # RAG 모듈
 from rag import (
@@ -44,8 +46,23 @@ from rag.llm import (
     HUGGINGFACE_MODELS,
 )
 
+# 1. Lifespan 정의: 서버 시작과 종료 시 실행될 로직을 모아둡니다.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # [STARTUP] 서버가 켜질 때 실행
+    try:
+        db.init_db()
+        print("✅ PostgreSQL 테이블 체크 및 준비 완료!")
+    except Exception as e:
+        print(f"❌ DB 연결 실패: {e}")
+    
+    yield  # 서버가 돌아가는 지점
+    
+    # [SHUTDOWN] 서버가 꺼질 때 실행 (필요 시 작성)
+    print("👋 서버를 종료합니다.")
 
-app = FastAPI(title="RAG Chatbot API", version="9.0.0")
+# 2. FastAPI 선언 시 lifespan을 등록합니다.
+app = FastAPI(title="RAG Chatbot API", version="9.0.0", lifespan=lifespan)  
 
 app.add_middleware(
     CORSMiddleware,
@@ -339,6 +356,16 @@ async def upload_document(
         metadatas = [{**c.metadata, "chunk_method": chunk_method, "model": model} for c in chunks]
         
         vector_store.add_documents(texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path)
+        # 🔥 [수정] PostgreSQL 저장 로직 (들여쓰기 주의!)
+        try:
+            db.save_chunks_to_db(
+                doc_id=metadata.get("sop_id") or filename, 
+                filename=filename, 
+                chunks=chunks
+            )
+            print(f"✅ PostgreSQL 저장 완료")
+        except Exception as db_err:
+            print(f"⚠️ PostgreSQL 저장 건너뜀 (오류): {db_err}")
         
         # 🔥 Neo4j 그래프에도 자동 업로드
         graph_uploaded = False
@@ -738,6 +765,8 @@ def graph_search_terms(term: str):
         return {"term": term, "results": results, "count": len(results)}
     except Exception as e:
         raise HTTPException(500, f"용어 검색 실패: {str(e)}")
+  
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════

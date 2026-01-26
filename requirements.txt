@@ -35,3 +35,5 @@ numpy
 
 # 기타
 requests
+
+# pip install psycopg2-binary
