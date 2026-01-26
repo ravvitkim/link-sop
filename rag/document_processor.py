@@ -144,8 +144,8 @@ def _detect_header_level(para, text: str) -> Optional[int]:
     # 5.1 xxx → H3
     if re.match(r'^\d+\.\d+\s+', text):
         return 3
-    # 5. xxx 또는 5 xxx → H2
-    if re.match(r'^\d+\.?\s+[가-힣A-Za-z]', text):
+    # 5. xxx 또는 5 xxx → H2 (점 있거나 없거나, 뒤에 영문 동반 가능)
+    if re.match(r'^\d+\.?\s+([가-힣A-Za-z].+)', text):
         return 2
     
     # 소제목 패턴 (한글 + 영문 괄호) → H3

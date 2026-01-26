@@ -116,10 +116,8 @@ def detect_section(line: str) -> Optional[Dict]:
         (r'^(\d+\.\d+\.\d+)\s+(.+)', 'subsubsection', 3),
         # 5.1 형식  
         (r'^(\d+\.\d+)\s+(.+)', 'subsection', 2),
-        # 5. 형식 (점 있음)
-        (r'^(\d+)\.\s+(.+)', 'section', 1),
-        # 5 xxx 형식 (점 없음, 공백으로 구분)
-        (r'^(\d+)\s+([가-힣A-Za-z].+)', 'section', 1),
+        # 5. 목적 Purpose 형식 (점 있거나 없거나, 뒤에 영문 동반 가능)
+        (r'^(\d+)\.?\s+([가-힣A-Za-z].+)', 'section', 1),
         # 제N조, 제N장
         (r'^제\s*(\d+)\s*조\s*(.*)', 'article', 1),
         (r'^제\s*(\d+)\s*장\s*(.*)', 'chapter', 1),
@@ -142,8 +140,8 @@ def detect_section(line: str) -> Optional[Dict]:
         if keyword == '목차':
             continue  # 이미 위에서 처리
         
-        # "목적 Purpose" 또는 "목적" 형식
-        pattern = rf'^{re.escape(keyword)}\s*({eng})?'
+        # "목적 Purpose" 또는 "목적" 형식 (영문 명칭이 포함되거나 포함되지 않은 경우 모두 대응)
+        pattern = rf'^{re.escape(keyword)}(\s+.*{re.escape(eng)}.*)?'
         if re.match(pattern, line, re.IGNORECASE):
             return {"num": keyword, "type": "named_section", "title": eng, "level": 1}
     
@@ -605,28 +603,26 @@ if __name__ == "__main__":
 목차 Table of Contents
 1 목적 Purpose
 2 적용 범위 Scope
+3 정의 Definitions
+4 책임 Responsibilities
 5 절차 Procedure
 5.1 품질관리기준서의 구성 및 관리
-5.1.1 품질관리기준서 문서번호는...
+5.2 시험방법서/규격서/검체채취기준서와의 연계
+5.3 시험 수행 및 결과 판정
+5.4 일탈(OOS/OOT) 및 조사 시 기준 적용
+5.5 개정 및 변경관리
+5.6 배포, 교육 및 이행 확인
+5.7 기록 및 보관
+6 참고문헌 Content Reference
+7 첨부 Attachments
 
-목적 Purpose
-본 기준서는 품질관리기준서의 작성, 검토, 승인에 관한 기준을 정한다.
+1 목적 Purpose
+1.1 본 기준서는 품질관리기준서(Quality Control Standard)의 작성, 검토, 승인, 적용 및 개정에 관한 기준을 규정하여, 원자재부터 완제품까지의 품질을 일관되게 확보하고 GMP 요구사항에 적합한 품질관리 체계를 유지하는 것을 목적으로 한다.
+The purpose of this standard is to define requirements for preparing, reviewing, approving, implementing, and revising the Quality Control Standard, ensuring consistent quality from raw materials to finished products and maintaining compliance with GMP requirements.
 
-적용 범위 Scope
-본 기준서는 회사 내 품질관리 활동 전반에 적용된다.
-
-절차 Procedure
-품질관리기준서의 구성 및 관리
-품질관리기준서는 다음 항목을 포함한다.
-
-5.1 품질관리기준서의 구성 및 관리
-품질관리기준서는 시험방법, 규격 등을 정의한다.
-
-5.1.1 문서번호 체계
-문서번호는 EQ-SOP-XXXXX 형식을 따른다.
-
-5.1.2 개정 관리
-개정 시 변경 이력을 기록한다.
+2 적용 범위 Scope
+2.1 본 기준서는 회사 내 품질관리(QC) 활동 전반에 적용되며, 원자재, 반제품, 완제품 및 포장자재의 시험, 판정, 방출 및 관련 기록 관리에 적용된다.
+This standard applies to overall Quality Control (QC) activities and covers testing, disposition, release, and related record management for raw materials, in-process materials, finished products, and packaging materials.
 """
     
     blocks = extract_blocks(test_text)

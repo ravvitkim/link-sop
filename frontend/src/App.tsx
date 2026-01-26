@@ -67,6 +67,12 @@ function App() {
   const [uploadStatus, setUploadStatus] = useState('')
   const [uploadLoading, setUploadLoading] = useState(false)
   
+  // 🔥 마크다운 미리보기 상태
+  const [previewMarkdown, setPreviewMarkdown] = useState('')
+  const [previewFilename, setPreviewFilename] = useState('')
+  const [showPreview, setShowPreview] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  
   // 설정 상태
   const [showSettings, setShowSettings] = useState(false)
   const [showSources, setShowSources] = useState(true)
@@ -137,6 +143,38 @@ function App() {
       setUploadStatus(`❌ 업로드 오류: ${error}`)
     } finally {
       setUploadLoading(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  const handlePreviewMarkdown = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setPreviewLoading(true)
+    setPreviewFilename(file.name)
+    setShowPreview(true)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+
+      const response = await fetch(`${API_URL}/rag/preview-markdown`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        setPreviewMarkdown(data.markdown)
+      } else {
+        const error = await response.json()
+        setPreviewMarkdown(`❌ 변환 실패: ${error.detail}`)
+      }
+    } catch (error) {
+      setPreviewMarkdown(`❌ 오류: ${error}`)
+    } finally {
+      setPreviewLoading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
     }
   }
@@ -344,6 +382,19 @@ function App() {
               className="file-input"
             />
             {uploadStatus && <p className="upload-status">{uploadStatus}</p>}
+            
+            {/* 🔥 마크다운 미리보기 */}
+            <div className="preview-section">
+              <h4>🔍 마크다운 미리보기</h4>
+              <input
+                type="file"
+                accept=".pdf,.docx,.doc,.txt,.md,.html"
+                onChange={handlePreviewMarkdown}
+                disabled={previewLoading}
+                className="file-input"
+              />
+              {previewLoading && <p className="preview-status">변환 중...</p>}
+            </div>
           </section>
 
           {/* 문서 목록 */}
@@ -532,6 +583,42 @@ function App() {
           </div>
         </main>
       </div>
+
+      {/* 🔥 마크다운 미리보기 모달 */}
+      {showPreview && (
+        <div className="modal-overlay" onClick={() => setShowPreview(false)}>
+          <div className="modal-content markdown-preview" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>📄 마크다운 미리보기 - {previewFilename}</h2>
+              <button className="close-btn" onClick={() => setShowPreview(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              {previewLoading ? (
+                <div className="loading">변환 중...</div>
+              ) : (
+                <pre className="markdown-content">{previewMarkdown}</pre>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button 
+                className="download-btn"
+                onClick={() => {
+                  const blob = new Blob([previewMarkdown], { type: 'text/markdown' })
+                  const url = URL.createObjectURL(blob)
+                  const a = document.createElement('a')
+                  a.href = url
+                  a.download = `${previewFilename.replace(/\.[^/.]+$/, '')}.md`
+                  a.click()
+                  URL.revokeObjectURL(url)
+                }}
+                disabled={previewLoading || !previewMarkdown}
+              >
+                💾 다운로드
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

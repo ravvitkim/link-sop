@@ -31,7 +31,7 @@ from rag import (
     get_available_methods,
     CHUNK_METHODS,
 )
-from rag.document_processor import process_document  # 🔥 v8.0 새 파이프라인
+from rag.document_processor import process_document, convert_to_markdown  # 🔥 v8.0 새 파이프라인
 from rag.document_pipeline import process_document as process_document_v9, state_to_chunks  # 🔥 v9.0 LangGraph
 from rag import vector_store
 from rag.prompt import build_rag_prompt, build_chunk_prompt
@@ -376,6 +376,29 @@ async def upload_document(
         raise
     except Exception as e:
         raise HTTPException(500, f"업로드 실패: {str(e)}")
+
+
+@app.post("/rag/preview-markdown")
+async def preview_markdown(file: UploadFile = File(...)):
+    """
+    문서를 마크다운으로 변환해서 미리보기
+    """
+    try:
+        content = await file.read()
+        filename = file.filename
+        
+        # 마크다운 변환
+        markdown_text, metadata = convert_to_markdown(filename, content)
+        
+        return {
+            "success": True,
+            "filename": filename,
+            "markdown": markdown_text,
+            "metadata": metadata,
+            "preview_url": f"data:text/markdown;base64,{markdown_text.encode('utf-8').decode('latin-1')}"  # 간단한 base64 인코딩 (실제로는 별도 처리 필요)
+        }
+    except Exception as e:
+        raise HTTPException(500, f"마크다운 변환 실패: {str(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

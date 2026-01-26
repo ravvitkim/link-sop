@@ -391,8 +391,21 @@ def node_optimize(state: PipelineState) -> PipelineState:
             
             # 섹션 타입 결정
             section_type, section_num = _determine_section_type(headers)
+            # 가장 낮은 레벨 헤더를 section으로 사용
             section_display = headers.get("H4") or headers.get("H3") or headers.get("H2") or headers.get("H1")
             
+            # 섹션 번호 추출 개선
+            section_num = None
+            if headers.get("H4"):
+                match = re.search(r'^(\d+\.\d+\.\d+)', headers["H4"])
+                section_num = match.group(1) if match else None
+            elif headers.get("H3"):
+                match = re.search(r'^(\d+\.\d+)', headers["H3"])
+                section_num = match.group(1) if match else None
+            elif headers.get("H2"):
+                match = re.search(r'^(\d+)', headers["H2"])
+                section_num = match.group(1) if match else None
+
             chunks.append({
                 "text": text.strip(),
                 "index": idx,
