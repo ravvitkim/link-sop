@@ -1,11 +1,12 @@
 """
-LangGraph 기반 문서 처리 파이프라인 v9.0
+LangGraph 기반 문서 처리 파이프라인 v9.1
 
-🔥 상태 머신(State Machine) 기반 유연한 워크플로우:
-- 문서 타입별 분기 처리
-- 변환 실패 시 폴백 전략
-- 품질 검증 및 보정 단계
-- 조건부 재처리
+🔥 v9.1 개선:
+- 페이지 번호 메타데이터 추가
+- Parent-Child 계층 구조 도입
+- 문서 헤더 메타데이터 추출 (SOP ID, Version, Date, Department)
+- 목차 중복 제거
+- 메타데이터 최적화 (불필요 필드 제거)
 
 노드 흐름:
 ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐
@@ -73,6 +74,58 @@ class Chunk:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 문서 메타데이터 추출
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_document_metadata(text: str, filename: str) -> Dict:
+    """
+    문서 헤더에서 메타데이터 추출
+    
+    Returns:
+        {
+            "sop_id": "EQ-SOP-00010",
+            "version": "1.0",
+            "effective_date": "2025-01-21",
+            "title": "품질관리기준서",
+            "department": "품질경영실",
+            "file_name": "xxx.pdf"
+        }
+    """
+    metadata = {"file_name": filename}
+    
+    # SOP ID
+    sop_match = re.search(r'Number:\s*(EQ-SOP-\d+)', text)
+    if not sop_match:
+        sop_match = re.search(r'(EQ-SOP-\d+)', text)
+    if sop_match:
+        metadata["sop_id"] = sop_match.group(1)
+    
+    # Version
+    ver_match = re.search(r'Version:\s*(\d+\.\d+)', text)
+    if not ver_match:
+        ver_match = re.search(r'Version\s*(\d+\.\d+)', text)
+    if ver_match:
+        metadata["version"] = ver_match.group(1)
+    
+    # Effective Date
+    date_match = re.search(r'Effective Date:\s*(\d{4}-\d{2}-\d{2})', text)
+    if date_match:
+        metadata["effective_date"] = date_match.group(1)
+    
+    # Title (한글 제목 우선)
+    title_match = re.search(r'Title\s+([가-힣]+)', text)
+    if title_match:
+        metadata["title"] = title_match.group(1)
+    
+    # Department
+    dept_match = re.search(r'Owning Department\s+([가-힣]+)', text)
+    if dept_match:
+        metadata["department"] = dept_match.group(1)
+    
+    return metadata
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 노드 함수들
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -83,20 +136,25 @@ def node_load(state: PipelineState) -> PipelineState:
     filename = state["filename"]
     content = state["content"]
     
-    # 파일 타입 감지 (확장자 버그 수정 포함)
+    # 🔥 실제 확장자 추출 (마지막 . 이후)
     filename_lower = filename.lower()
+    if '.' in filename_lower:
+        actual_ext = filename_lower.rsplit('.', 1)[-1]
+    else:
+        actual_ext = ''
     
-    if '.docx' in filename_lower:
-        file_type = 'docx'
-    elif '.doc' in filename_lower and '.docx' not in filename_lower:
-        file_type = 'doc'
-    elif '.pdf' in filename_lower:
+    # 확장자 기반 타입 결정
+    if actual_ext == 'pdf':
         file_type = 'pdf'
-    elif '.html' in filename_lower or '.htm' in filename_lower:
+    elif actual_ext == 'docx':
+        file_type = 'docx'
+    elif actual_ext == 'doc':
+        file_type = 'doc'
+    elif actual_ext in ['html', 'htm']:
         file_type = 'html'
-    elif '.md' in filename_lower:
+    elif actual_ext == 'md':
         file_type = 'markdown'
-    elif '.txt' in filename_lower:
+    elif actual_ext == 'txt':
         file_type = 'text'
     else:
         file_type = 'unknown'
@@ -134,6 +192,9 @@ def node_convert(state: PipelineState) -> PipelineState:
         elif file_type == 'pdf':
             markdown, metadata, method = _convert_pdf_with_fallback(filename, content)
             state["conversion_method"] = method
+            # 🔥 PDF는 헤더 추론 필수!
+            markdown = _infer_headers(markdown)
+            state["conversion_method"] += "+infer-headers"
             
         elif file_type == 'html':
             markdown, metadata = _convert_html(filename, content)
@@ -150,11 +211,14 @@ def node_convert(state: PipelineState) -> PipelineState:
             state["conversion_method"] = "text-inference"
             
         else:
-            # 알 수 없는 타입 → 텍스트로 시도
             markdown = content.decode('utf-8', errors='ignore')
             metadata = {}
             state["conversion_method"] = "fallback-text"
             state["warnings"] = [f"알 수 없는 파일 타입: {file_type}, 텍스트로 처리"]
+        
+        # 🔥 문서 메타데이터 추출
+        doc_meta = extract_document_metadata(markdown, filename)
+        metadata.update(doc_meta)
         
         state["markdown"] = markdown
         state["metadata"].update(metadata)
@@ -177,22 +241,19 @@ def node_convert_fallback(state: PipelineState) -> PipelineState:
     
     try:
         if file_type == 'pdf':
-            # PDF 폴백: PyPDF2 → pdfplumber → 텍스트 추출
             markdown = _pdf_fallback_extract(content)
             state["conversion_method"] = "pdf-fallback"
             
         elif file_type == 'docx':
-            # DOCX 폴백: XML 직접 파싱
             markdown = _docx_fallback_extract(content)
             state["conversion_method"] = "docx-fallback"
             
         else:
-            # 최후의 수단: 바이너리에서 텍스트 추출 시도
             markdown = content.decode('utf-8', errors='ignore')
             state["conversion_method"] = "binary-text"
         
         state["markdown"] = markdown
-        state["errors"] = []  # 에러 클리어
+        state["errors"] = []
         
     except Exception as e:
         state["errors"] = [f"폴백 변환도 실패: {str(e)}"]
@@ -212,7 +273,6 @@ def node_validate(state: PipelineState) -> PipelineState:
         state["errors"] = ["마크다운 변환 결과가 비어있습니다."]
         return state
     
-    # 품질 점수 계산
     score = 0.0
     issues = []
     
@@ -232,7 +292,7 @@ def node_validate(state: PipelineState) -> PipelineState:
     else:
         issues.append("헤더가 없음")
     
-    # 3. 문단 구조 (빈 줄로 구분된 문단)
+    # 3. 문단 구조
     paragraphs = [p for p in markdown.split('\n\n') if p.strip()]
     if len(paragraphs) >= 5:
         score += 0.2
@@ -240,7 +300,7 @@ def node_validate(state: PipelineState) -> PipelineState:
         score += 0.1
         issues.append("문단 구조가 부실함")
     
-    # 4. 한글 비율 (SOP 문서 특성상 한글이 있어야 함)
+    # 4. 한글 비율
     korean_chars = len(re.findall(r'[가-힣]', markdown))
     total_chars = len(markdown)
     korean_ratio = korean_chars / total_chars if total_chars > 0 else 0
@@ -272,6 +332,7 @@ def node_repair(state: PipelineState) -> PipelineState:
     markdown = state.get("markdown", "")
     
     state["warnings"] = ["품질 보정 수행 중..."]
+    state["retry_count"] = state.get("retry_count", 0) + 1
     
     # 1. 특수문자 제거
     markdown = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', markdown)
@@ -297,7 +358,7 @@ def node_repair(state: PipelineState) -> PipelineState:
 
 def node_split(state: PipelineState) -> PipelineState:
     """
-    4단계: 헤더 기준 분할
+    4단계: 헤더 기준 분할 + 계층 구조 구축
     """
     markdown = state.get("markdown", "")
     
@@ -310,28 +371,62 @@ def node_split(state: PipelineState) -> PipelineState:
     
     current_headers = {1: None, 2: None, 3: None, 4: None, 5: None, 6: None}
     current_content = []
+    current_page = 1
+    in_toc = False
     
     def flush_section():
         nonlocal current_content
         if current_content:
             content = '\n'.join(current_content).strip()
             if content:
+                # 🔥 계층 경로 생성
                 header_path_parts = []
                 headers_dict = {}
                 for level in range(1, 7):
                     if current_headers[level]:
                         headers_dict[f"H{level}"] = current_headers[level]
-                        if level >= 2:
-                            header_path_parts.append(current_headers[level])
+                        header_path_parts.append(current_headers[level])
+                
+                # 🔥 Parent-Child 관계
+                parent = None
+                for level in range(6, 0, -1):
+                    if current_headers[level]:
+                        # 현재 레벨보다 한 단계 위 찾기
+                        for p_level in range(level - 1, 0, -1):
+                            if current_headers[p_level]:
+                                parent = current_headers[p_level]
+                                break
+                        break
                 
                 sections.append({
                     "content": content,
                     "headers": headers_dict,
-                    "header_path": " > ".join(header_path_parts) if header_path_parts else None
+                    "header_path": " > ".join(header_path_parts) if header_path_parts else None,
+                    "page": current_page,
+                    "parent": parent,
                 })
         current_content = []
     
     for line in lines:
+        # 🔥 페이지 마커 감지
+        page_match = re.match(r'<!-- PAGE:(\d+) -->', line)
+        if page_match:
+            current_page = int(page_match.group(1))
+            continue
+        
+        # 🔥 목차 감지 및 스킵
+        if re.match(r'^#{1,2}\s+목차|^#{1,2}\s+Table of Contents', line, re.IGNORECASE):
+            in_toc = True
+            continue
+        
+        # 목차 종료 감지 (다음 주요 섹션 시작)
+        if in_toc:
+            if re.match(r'^##\s+\d+\s+목적|^##\s+1\s+', line):
+                in_toc = False
+            else:
+                continue  # 목차 내용 스킵
+        
+        # 헤더 감지
         header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
         
         if header_match:
@@ -355,7 +450,7 @@ def node_split(state: PipelineState) -> PipelineState:
 
 def node_optimize(state: PipelineState) -> PipelineState:
     """
-    5단계: 긴 섹션 재분할 + 컨텍스트 프리픽스
+    5단계: 긴 섹션 재분할 + 최적화된 메타데이터
     """
     sections = state.get("sections", [])
     chunk_size = state.get("chunk_size", 500)
@@ -365,13 +460,18 @@ def node_optimize(state: PipelineState) -> PipelineState:
     chunks = []
     idx = 0
     
+    # 🔥 문서 레벨 메타데이터
     sop_id = metadata.get("sop_id")
     doc_name = metadata.get("file_name")
+    version = metadata.get("version")
+    effective_date = metadata.get("effective_date")
     
     for section in sections:
         content = section["content"]
         headers = section.get("headers", {})
         header_path = section.get("header_path")
+        page = section.get("page", 1)
+        parent = section.get("parent")
         
         # 긴 섹션 재분할
         if len(content) > chunk_size:
@@ -389,41 +489,39 @@ def node_optimize(state: PipelineState) -> PipelineState:
             if is_split and i > 0 and header_path:
                 text = f"[Context: {header_path}]\n\n{text}"
             
-            # 섹션 타입 결정
-            section_type, section_num = _determine_section_type(headers)
-            # 가장 낮은 레벨 헤더를 section으로 사용
-            section_display = headers.get("H4") or headers.get("H3") or headers.get("H2") or headers.get("H1")
-            
-            # 섹션 번호 추출 개선
+            # 🔥 조항 번호 추출 개선
             section_num = None
-            if headers.get("H4"):
-                match = re.search(r'^(\d+\.\d+\.\d+)', headers["H4"])
-                section_num = match.group(1) if match else None
-            elif headers.get("H3"):
-                match = re.search(r'^(\d+\.\d+)', headers["H3"])
-                section_num = match.group(1) if match else None
-            elif headers.get("H2"):
-                match = re.search(r'^(\d+)', headers["H2"])
-                section_num = match.group(1) if match else None
-
+            current_section = headers.get("H4") or headers.get("H3") or headers.get("H2")
+            
+            if current_section:
+                # 5.1.2.1, 5.1.1, 5.1, 5 패턴
+                num_match = re.match(r'^(\d+(?:\.\d+)*)', current_section)
+                if num_match:
+                    section_num = num_match.group(1)
+            
+            # 🔥 최적화된 메타데이터 (필수 + 유용한 것만)
             chunks.append({
                 "text": text.strip(),
                 "index": idx,
                 "metadata": {
+                    # 🔥 필수 (검색/필터링)
                     "doc_name": doc_name,
-                    "doc_title": sop_id or doc_name,
                     "sop_id": sop_id,
-                    "article_num": section_num,
-                    "article_type": section_type,
-                    "section": section_display,
                     "section_path": header_path,
-                    "section_path_readable": header_path,
-                    "H1": headers.get("H1"),
-                    "H2": headers.get("H2"),
-                    "H3": headers.get("H3"),
-                    "H4": headers.get("H4"),
+                    "section": current_section,
+                    
+                    # 🔥 유용 (출처/분석)
+                    "article_num": section_num,
+                    "page": page,
+                    "parent": parent,
+                    
+                    # 🔥 분할 청크 추적
                     "chunk_part": i + 1 if is_split else None,
                     "total_parts": len(text_chunks) if is_split else None,
+                    
+                    # 🔥 문서 버전 정보 (선택적)
+                    "version": version,
+                    "effective_date": effective_date,
                 }
             })
             idx += 1
@@ -468,17 +566,9 @@ def should_repair(state: PipelineState) -> Literal["repair", "split"]:
     quality_score = state.get("quality_score", 0)
     retry_count = state.get("retry_count", 0)
     
-    # 품질이 낮고 재시도 횟수가 2회 미만이면 보정
     if quality_score < 0.5 and retry_count < 2:
         return "repair"
     return "split"
-
-
-def is_failed(state: PipelineState) -> Literal["end", "continue"]:
-    """실패 상태면 종료"""
-    if state.get("errors") and state.get("success") == False:
-        return "end"
-    return "continue"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -495,7 +585,6 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
     
     sop_pattern = re.compile(r'((?:EQ-)?SOP[-_]?\d{4,5})', re.IGNORECASE)
     
-    # 주요 섹션 키워드
     main_sections = ['목적', 'Purpose', '적용 범위', 'Scope', '정의', 'Definitions',
                      '책임', 'Responsibilities', '절차', 'Procedure', 
                      '참고문헌', 'Reference', '첨부', 'Attachments']
@@ -517,7 +606,6 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
         # 헤더 레벨 결정
         header_level = None
         
-        # Word 스타일 기반
         style_name = para.style.name.lower() if para.style else ""
         if 'heading 1' in style_name or 'title' in style_name:
             header_level = 1
@@ -528,7 +616,6 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
         elif 'heading 4' in style_name:
             header_level = 4
         
-        # 패턴 기반 감지
         if not header_level:
             for section in main_sections:
                 if text.startswith(section) or re.match(rf'^\d+\s+{section}', text):
@@ -536,7 +623,9 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
                     break
             
             if not header_level:
-                if re.match(r'^\d+\.\d+\.\d+\s+', text):
+                if re.match(r'^\d+\.\d+\.\d+\.\d+\s*', text):
+                    header_level = 5
+                elif re.match(r'^\d+\.\d+\.\d+\s+', text):
                     header_level = 4
                 elif re.match(r'^\d+\.\d+\s+', text):
                     header_level = 3
@@ -559,9 +648,25 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
 
 
 def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
-    """PDF 변환 (다중 폴백)"""
+    """PDF 변환 (다중 폴백) + 페이지 마커"""
     
-    # 1순위: Docling
+    # 1순위: pdfplumber (가장 안정적)
+    try:
+        import pdfplumber
+        md_lines = []
+        with pdfplumber.open(BytesIO(content)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ''
+                if text.strip():
+                    # 🔥 페이지 마커 삽입
+                    md_lines.append(f"<!-- PAGE:{i + 1} -->")
+                    md_lines.append(text)
+        if md_lines:
+            return '\n'.join(md_lines), {"parser": "pdfplumber", "total_pages": len(pdf.pages)}, "pdfplumber"
+    except Exception as e:
+        print(f"   pdfplumber 실패: {e}")
+    
+    # 2순위: Docling
     try:
         from docling.document_converter import DocumentConverter
         import tempfile
@@ -578,10 +683,10 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
             return markdown, {"parser": "docling"}, "docling"
         finally:
             os.unlink(temp_path)
-    except:
-        pass
+    except Exception as e:
+        print(f"   Docling 실패: {e}")
     
-    # 2순위: PyMuPDF
+    # 3순위: PyMuPDF
     try:
         import fitz
         pdf = fitz.open(stream=content, filetype="pdf")
@@ -589,13 +694,13 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
         for page_num, page in enumerate(pdf):
             text = page.get_text()
             if text.strip():
-                md_lines.append(f"<!-- Page {page_num + 1} -->")
+                md_lines.append(f"<!-- PAGE:{page_num + 1} -->")
                 md_lines.append(text)
-        return '\n'.join(md_lines), {"parser": "pymupdf"}, "pymupdf"
-    except:
-        pass
+        return '\n'.join(md_lines), {"parser": "pymupdf", "total_pages": len(pdf)}, "pymupdf"
+    except Exception as e:
+        print(f"   PyMuPDF 실패: {e}")
     
-    # 3순위: PyPDF2
+    # 4순위: PyPDF2
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(BytesIO(content))
@@ -603,11 +708,11 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ''
             if text.strip():
-                md_lines.append(f"<!-- Page {i + 1} -->")
+                md_lines.append(f"<!-- PAGE:{i + 1} -->")
                 md_lines.append(text)
-        return '\n'.join(md_lines), {"parser": "pypdf2"}, "pypdf2"
-    except:
-        pass
+        return '\n'.join(md_lines), {"parser": "pypdf2", "total_pages": len(reader.pages)}, "pypdf2"
+    except Exception as e:
+        print(f"   PyPDF2 실패: {e}")
     
     raise Exception("모든 PDF 파서 실패")
 
@@ -644,35 +749,7 @@ def _convert_html(filename: str, content: bytes) -> tuple:
 
 def _convert_text_to_markdown(text: str) -> str:
     """텍스트 → 마크다운 (헤더 추론)"""
-    lines = text.split('\n')
-    md_lines = []
-    
-    main_sections = ['목적', '적용 범위', '정의', '책임', '절차', '참고문헌', '첨부']
-    
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            md_lines.append("")
-            continue
-        
-        is_header = False
-        for section in main_sections:
-            if stripped.startswith(section):
-                md_lines.append(f"## {stripped}")
-                is_header = True
-                break
-        
-        if not is_header:
-            if re.match(r'^\d+\.\d+\.\d+\s+', stripped):
-                md_lines.append(f"#### {stripped}")
-            elif re.match(r'^\d+\.\d+\s+', stripped):
-                md_lines.append(f"### {stripped}")
-            elif re.match(r'^\d+\.?\s+[가-힣A-Za-z]', stripped):
-                md_lines.append(f"## {stripped}")
-            else:
-                md_lines.append(stripped)
-    
-    return '\n'.join(md_lines)
+    return _infer_headers(text)
 
 
 def _pdf_fallback_extract(content: bytes) -> str:
@@ -680,12 +757,13 @@ def _pdf_fallback_extract(content: bytes) -> str:
     try:
         import pdfplumber
         with pdfplumber.open(BytesIO(content)) as pdf:
-            texts = [page.extract_text() or '' for page in pdf.pages]
+            texts = []
+            for i, page in enumerate(pdf.pages):
+                texts.append(f"<!-- PAGE:{i+1} -->")
+                texts.append(page.extract_text() or '')
             return '\n\n'.join(texts)
     except:
         pass
-    
-    # 최후의 수단
     return content.decode('latin-1', errors='ignore')
 
 
@@ -699,8 +777,6 @@ def _docx_fallback_extract(content: bytes) -> str:
             xml_content = zf.read('word/document.xml')
             tree = ElementTree.fromstring(xml_content)
             
-            # 모든 텍스트 추출
-            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
             texts = []
             for t in tree.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
                 if t.text:
@@ -733,31 +809,78 @@ def _table_to_markdown(table) -> str:
 
 
 def _infer_headers(markdown: str) -> str:
-    """헤더 추론 삽입"""
+    """헤더 추론 삽입 (PDF용 강화)"""
     lines = markdown.split('\n')
     result = []
     
-    main_sections = ['목적', '적용 범위', '정의', '책임', '절차', '참고문헌', '첨부']
+    main_sections = ['목적', '적용 범위', '정의', '책임', '절차', '참고문헌', '첨부',
+                     'Purpose', 'Scope', 'Definitions', 'Responsibilities', 'Procedure', 
+                     'Reference', 'Attachments']
+    
+    # 🔥 무시할 패턴 (페이지 번호 등) - 텍스트는 유지하되 헤더로 안 만듦
+    ignore_patterns = [
+        r'^\d+\s+of\s+\d+$',
+        r'^Page\s+\d+',
+        r'^-\s*\d+\s*-$',
+        r'^Number:\s*',
+        r'^<!--\s*PAGE',
+    ]
     
     for line in lines:
         stripped = line.strip()
         
-        # 주요 섹션 키워드로 시작하면 H2
+        if not stripped:
+            result.append(line)
+            continue
+        
+        # 무시 패턴 체크 (헤더로 안 만들고 텍스트 유지)
+        should_ignore = False
+        for pattern in ignore_patterns:
+            if re.match(pattern, stripped, re.IGNORECASE):
+                should_ignore = True
+                break
+        
+        if should_ignore:
+            result.append(line)
+            continue
+        
+        # 1. 숫자형 헤더 패턴
+        # 5.1.2.1 xxx → H5
+        if re.match(r'^(\d+\.\d+\.\d+\.\d+)\s*(.+)', stripped):
+            result.append(f"##### {stripped}")
+            continue
+        
+        # 5.1.1 xxx → H4
+        if re.match(r'^(\d+\.\d+\.\d+)\s+(.+)', stripped):
+            result.append(f"#### {stripped}")
+            continue
+        
+        # 5.1 xxx → H3
+        if re.match(r'^(\d+\.\d+)\s+(.+)', stripped):
+            result.append(f"### {stripped}")
+            continue
+        
+        # 5 xxx → H2
+        match = re.match(r'^(\d+)\s+([가-힣A-Za-z].+)', stripped)
+        if match:
+            num = match.group(1)
+            text = match.group(2)
+            if not re.match(r'^of\s+\d+', text, re.IGNORECASE):
+                result.append(f"## {stripped}")
+                continue
+        
+        # 2. 주요 섹션 키워드 → H2
         matched = False
         for section in main_sections:
-            if stripped.startswith(section):
+            if stripped.startswith(section) and len(stripped) < 50:
                 result.append(f"## {stripped}")
                 matched = True
                 break
         
         if not matched:
-            # 숫자 패턴
-            if re.match(r'^\d+\.\d+\.\d+\s+', stripped):
-                result.append(f"#### {stripped}")
-            elif re.match(r'^\d+\.\d+\s+', stripped):
+            # 3. 소제목 패턴 → H3
+            if re.match(r'^[가-힣][가-힣\s\(\)/·\-]+\s*\([A-Za-z\s&/\-:]+\)\s*$', stripped):
                 result.append(f"### {stripped}")
-            elif re.match(r'^\d+\.?\s+[가-힣A-Za-z]', stripped):
-                result.append(f"## {stripped}")
             else:
                 result.append(line)
     
@@ -779,11 +902,7 @@ def _repair_tables(markdown: str) -> str:
                 in_table = True
                 table_cols = cols
                 result.append(line)
-                # 구분선이 없으면 추가
-                if len(result) >= 1:
-                    next_idx = len(result)
             else:
-                # 열 수 맞추기
                 while line.count('|') - 1 < table_cols:
                     line = line.rstrip('|') + ' |'
                 result.append(line)
@@ -826,33 +945,8 @@ def _split_recursive(text: str, chunk_size: int, overlap: int) -> List[str]:
             
             return chunks
     
-    # 강제 분할
     step = chunk_size - effective_overlap if effective_overlap > 0 else chunk_size
     return [text[i:i+chunk_size] for i in range(0, len(text), step)]
-
-
-def _determine_section_type(headers: Dict) -> tuple:
-    """섹션 타입 결정"""
-    section_type = "text"
-    section_num = None
-    
-    if headers.get("H4"):
-        section_type = "subsubsection"
-        match = re.match(r'^(\d+\.\d+\.\d+)', headers["H4"])
-        if match:
-            section_num = match.group(1)
-    elif headers.get("H3"):
-        section_type = "subsection"
-        match = re.match(r'^(\d+\.\d+)', headers["H3"])
-        if match:
-            section_num = match.group(1)
-    elif headers.get("H2"):
-        section_type = "section"
-        match = re.match(r'^(\d+)', headers["H2"])
-        if match:
-            section_num = match.group(1)
-    
-    return section_type, section_num
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -860,18 +954,14 @@ def _determine_section_type(headers: Dict) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_pipeline():
-    """
-    LangGraph 파이프라인 구성
-    """
+    """LangGraph 파이프라인 구성"""
     try:
         from langgraph.graph import StateGraph, END
     except ImportError:
         raise ImportError("langgraph 패키지가 필요합니다: pip install langgraph")
     
-    # 그래프 생성
     workflow = StateGraph(PipelineState)
     
-    # 노드 추가
     workflow.add_node("load", node_load)
     workflow.add_node("convert", node_convert)
     workflow.add_node("fallback", node_convert_fallback)
@@ -881,7 +971,6 @@ def build_pipeline():
     workflow.add_node("optimize", node_optimize)
     workflow.add_node("finalize", node_finalize)
     
-    # 엣지 정의 (흐름)
     workflow.set_entry_point("load")
     
     workflow.add_edge("load", "convert")
@@ -889,10 +978,7 @@ def build_pipeline():
     workflow.add_conditional_edges(
         "convert",
         should_fallback,
-        {
-            "fallback": "fallback",
-            "validate": "validate"
-        }
+        {"fallback": "fallback", "validate": "validate"}
     )
     
     workflow.add_edge("fallback", "validate")
@@ -900,10 +986,7 @@ def build_pipeline():
     workflow.add_conditional_edges(
         "validate",
         should_repair,
-        {
-            "repair": "repair",
-            "split": "split"
-        }
+        {"repair": "repair", "split": "split"}
     )
     
     workflow.add_edge("repair", "split")
@@ -925,12 +1008,8 @@ def process_document(
     chunk_overlap: int = 50,
     debug: bool = False
 ) -> dict:
-    """
-    문서 처리 메인 함수
+    """문서 처리 메인 함수"""
     
-    LangGraph 파이프라인 실행
-    """
-    # 초기 상태
     initial_state: PipelineState = {
         "filename": filename,
         "content": content,
@@ -950,7 +1029,6 @@ def process_document(
     }
     
     try:
-        # LangGraph 파이프라인 실행
         pipeline = build_pipeline()
         result = pipeline.invoke(initial_state)
         
@@ -970,16 +1048,13 @@ def process_document(
         return result
         
     except ImportError:
-        # LangGraph 없으면 심플 파이프라인 사용
         if debug:
             print("⚠️ LangGraph 없음, 심플 파이프라인 사용")
         return _simple_pipeline(initial_state, debug)
 
 
 def _simple_pipeline(state: PipelineState, debug: bool = False) -> dict:
-    """
-    LangGraph 없을 때 사용하는 심플 파이프라인
-    """
+    """LangGraph 없을 때 사용하는 심플 파이프라인"""
     state = node_load(state)
     if state.get("errors"):
         return state
@@ -1024,27 +1099,4 @@ def state_to_chunks(state: dict) -> List[Chunk]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # 테스트 마크다운
-    test_md = """# EQ-SOP-00010 품질관리기준서
-
-## 목적 Purpose
-
-본 기준서는 품질관리기준서의 작성, 검토, 승인에 관한 기준을 정한다.
-
-## 적용 범위 Scope
-
-본 기준서는 회사 내 품질관리 활동 전반에 적용된다.
-
-## 절차 Procedure
-
-품질관리기준서는 다음 항목을 포함한다.
-"""
-    
-    result = process_document("test.md", test_md.encode(), chunk_size=300, debug=True)
-    
-    print(f"\n✅ 성공: {result.get('success')}")
-    print(f"📊 청크 수: {len(result.get('chunks', []))}")
-    
-    for chunk in result.get('chunks', [])[:3]:
-        print(f"\n📍 {chunk['metadata'].get('section_path_readable', 'N/A')}")
-        print(f"   {chunk['text'][:60]}...")
+    print("🔥 document_pipeline v9.1 테스트")

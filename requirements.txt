@@ -9,6 +9,16 @@ python-multipart
 python-docx
 beautifulsoup4
 
+# PDF 파싱
+PyMuPDF
+PyPDF2
+docling
+
+# 🔥 OCR (이미지 기반 PDF용)
+pytesseract
+pdf2image
+Pillow
+
 # 벡터 스토어
 chromadb
 

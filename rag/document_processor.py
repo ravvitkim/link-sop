@@ -46,18 +46,18 @@ def convert_to_markdown(filename: str, content: bytes) -> Tuple[str, Dict]:
     Returns:
         (markdown_text, metadata)
     """
-    # 확장자 감지
-    filename_lower = filename.lower()
-    if '.docx' in filename_lower:
+    # 확장자 감지 (마지막 확장자 기준)
+    ext = filename.split('.')[-1].lower()
+    if ext == 'docx':
         return _docx_to_markdown(filename, content)
-    elif '.pdf' in filename_lower:
+    elif ext == 'pdf':
         return _pdf_to_markdown(filename, content)
-    elif '.html' in filename_lower or '.htm' in filename_lower:
+    elif ext in ['html', 'htm']:
         return _html_to_markdown(filename, content)
-    elif '.md' in filename_lower:
+    elif ext == 'md':
         text = content.decode('utf-8', errors='ignore')
         return text, {"file_name": filename, "file_type": ".md"}
-    elif '.txt' in filename_lower:
+    elif ext == 'txt':
         text = content.decode('utf-8', errors='ignore')
         return _text_to_markdown(text), {"file_name": filename, "file_type": ".txt"}
     else:
@@ -241,7 +241,51 @@ def _pdf_to_markdown(filename: str, content: bytes) -> Tuple[str, Dict]:
         return '\n'.join(md_lines), metadata
         
     except ImportError:
-        return "[PDF 파싱 실패: 필요한 라이브러리 없음]", metadata
+        pass
+    
+    try:
+        # OCR fallback (이미지 기반 PDF용)
+        md_lines, ocr_success = _pdf_to_markdown_ocr(content)
+        if ocr_success:
+            metadata["parser"] = "ocr"
+            return '\n'.join(md_lines), metadata
+        
+    except ImportError:
+        pass
+    
+    return "[PDF 파싱 실패: 모든 방법 시도했으나 실패]", metadata
+
+
+def _pdf_to_markdown_ocr(content: bytes) -> Tuple[List[str], bool]:
+    """
+    PDF OCR 처리 (이미지 기반 PDF용)
+    
+    Returns:
+        (md_lines, success)
+    """
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+        from PIL import Image
+        
+        # PDF를 이미지로 변환
+        # 환경변수 PATH에 poppler가 등록되어 있어야 함
+        pages = convert_from_bytes(content, dpi=300)
+        
+        md_lines = []
+        for i, page in enumerate(pages):
+            # OCR 실행 (한글+영어)
+            text = pytesseract.image_to_string(page, lang='kor+eng')
+            
+            if text.strip():
+                md_lines.append(f"<!-- Page {i + 1} (OCR) -->")
+                md_lines.append(text)
+        
+        return md_lines, len(md_lines) > 0
+        
+    except Exception as e:
+        print(f"OCR 처리 실패: {e}")
+        return [], False
 
 
 def _html_to_markdown(filename: str, content: bytes) -> Tuple[str, Dict]:

@@ -1,14 +1,58 @@
 # 🤖 RAG Chatbot v9.0
 
-**LangGraph 기반 GMP/SOP 문서 처리 시스템**
+**LangGraph 상태 머신 기반 GMP/SOP 문서 처리 시스템**
 
 PDF, DOCX, HTML 문서를 마크다운으로 변환하고, 계층적 섹션 구조를 추출하여 벡터 DB에 저장하는 RAG(Retrieval-Augmented Generation) 시스템입니다.
 
 ---
 
-## ✨ 주요 기능
+## 🆕 v9.0 주요 변경사항
 
-### 🔄 LangGraph 상태 머신 파이프라인
+### 🔥 LangGraph 상태 머신 도입
+
+기존 선형 파이프라인의 한계를 극복하기 위해 **LangGraph**를 도입했습니다:
+
+| 기존 (v8.0 선형) | 신규 (v9.0 LangGraph) |
+|-----------------|----------------------|
+| 순차 실행만 가능 | 조건부 분기 처리 |
+| 실패 시 전체 중단 | 폴백 전략 자동 실행 |
+| 고정된 처리 흐름 | 품질 기반 동적 라우팅 |
+| 에러 추적 어려움 | 상태 기반 에러 누적 |
+
+### 📦 LangGraph 핵심 개념
+
+```python
+from langgraph.graph import StateGraph, END
+
+# 1. 상태 정의 (TypedDict)
+class PipelineState(TypedDict):
+    filename: str
+    content: bytes
+    markdown: str
+    quality_score: float
+    errors: Annotated[List[str], operator.add]  # 에러 누적
+    ...
+
+# 2. 노드 함수
+def node_convert(state): ...
+def node_validate(state): ...
+
+# 3. 조건부 라우팅
+def should_fallback(state) -> Literal["fallback", "validate"]:
+    if state.get("errors"):
+        return "fallback"
+    return "validate"
+
+# 4. 그래프 빌드
+workflow = StateGraph(PipelineState)
+workflow.add_node("convert", node_convert)
+workflow.add_conditional_edges("convert", should_fallback, {...})
+pipeline = workflow.compile()
+```
+
+---
+
+## 🔄 LangGraph 파이프라인 아키텍처
 
 ```
 ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐    ┌──────────┐    ┌──────────┐
@@ -18,31 +62,81 @@ PDF, DOCX, HTML 문서를 마크다운으로 변환하고, 계층적 섹션 구�
                     ▼              ▼
               ┌──────────┐  ┌──────────┐
               │ Fallback │  │  Repair  │
+              │ (변환실패)│  │ (품질↓) │
               └──────────┘  └──────────┘
 ```
 
+### 노드별 상세 기능
+
 | 노드 | 기능 | 분기 조건 |
 |------|------|----------|
-| **Load** | 파일 타입 감지 | - |
-| **Convert** | 마크다운 변환 | 실패 시 → Fallback |
-| **Fallback** | 대체 파서 시도 | PDF: pdfplumber → Docling → PyMuPDF |
-| **Validate** | 품질 점수 계산 | 점수 < 50% → Repair |
-| **Repair** | 헤더 추론, 테이블 복구 | - |
-| **Split** | 헤더 기준 분할 | - |
-| **Optimize** | 재분할 + 컨텍스트 프리픽스 | - |
-| **Finalize** | 결과 정리 | - |
+| **Load** | 파일 타입 감지 (실제 확장자 기준) | - |
+| **Convert** | 문서 → 마크다운 변환 | 실패 시 → Fallback |
+| **Fallback** | 대체 파서 시도 | PDF: pdfplumber → Docling → PyMuPDF → PyPDF2 |
+| **Validate** | 품질 점수 계산 (0~100%) | 점수 < 50% → Repair |
+| **Repair** | 헤더 추론, 테이블 복구, 특수문자 제거 | - |
+| **Split** | 마크다운 헤더 기준 분할 | - |
+| **Optimize** | 긴 섹션 재분할 + 컨텍스트 프리픽스 | - |
+| **Finalize** | 결과 정리 및 통계 | - |
 
-### 📄 지원 파일 형식
+### 조건부 라우팅 로직
+
+```python
+# 1. 변환 실패 → 폴백
+def should_fallback(state) -> Literal["fallback", "validate"]:
+    if state.get("errors") or not state.get("markdown"):
+        return "fallback"
+    return "validate"
+
+# 2. 품질 낮음 → 보정
+def should_repair(state) -> Literal["repair", "split"]:
+    if state.get("quality_score", 0) < 0.5 and state.get("retry_count", 0) < 2:
+        return "repair"
+    return "split"
+```
+
+---
+
+## 📊 품질 검증 시스템
+
+5가지 항목으로 문서 변환 품질을 0~100%로 측정:
+
+| 항목 | 기준 | 배점 |
+|------|------|------|
+| 텍스트 길이 | ≥ 100자 | 20% |
+| 헤더 개수 | ≥ 3개 | 30% |
+| 문단 구조 | ≥ 5개 | 20% |
+| 한글 비율 | ≥ 10% | 20% |
+| 특수문자 오염 | < 1% | 10% |
+
+**품질 점수 < 50%** 이면 자동으로 `Repair` 노드로 라우팅되어 보정 수행.
+
+---
+
+## 📄 지원 파일 형식
 
 | 형식 | 파서 | 특징 |
 |------|------|------|
-| `.docx` | python-docx | Word 스타일 기반 헤더 감지 |
-| `.pdf` | pdfplumber + 헤더 추론 | 다중 폴백 전략 |
+| `.docx` | python-docx | Word 스타일 + 패턴 기반 헤더 감지 |
+| `.pdf` | pdfplumber (1순위) | 다중 폴백 + 헤더 추론 |
 | `.html` | BeautifulSoup | HTML 태그 → 마크다운 |
 | `.md` | 직접 처리 | 패스스루 |
 | `.txt` | 헤더 추론 | 패턴 기반 |
 
-### 🔍 계층적 섹션 경로 (section_path)
+### PDF 폴백 순서
+
+```
+1. pdfplumber (가장 안정적)
+2. Docling (최고 품질, 무거움)
+3. PyMuPDF (fitz)
+4. PyPDF2
+```
+
+---
+
+## 🔍 계층적 섹션 경로 (section_path)
+
+문서의 계층 구조를 추적하여 검색 품질 향상:
 
 ```
 📍 5 절차 Procedure
@@ -50,13 +144,15 @@ PDF, DOCX, HTML 문서를 마크다운으로 변환하고, 계층적 섹션 구�
 📍 5 절차 Procedure > 5.1 품질관리기준서의 구성 및 관리 > 5.1.1 문서번호 체계
 ```
 
-### 📊 품질 검증 (5가지 항목)
+### 컨텍스트 프리픽스 (v8.1+)
 
-1. ✅ 텍스트 길이 (≥100자)
-2. ✅ 헤더 개수 (≥3개)
-3. ✅ 문단 구조 (≥5개)
-4. ✅ 한글 비율 (≥10%)
-5. ✅ 특수문자 오염 (<1%)
+긴 섹션이 재분할될 때, 두 번째 청크부터 헤더 경로를 텍스트에 삽입:
+
+```
+[Context: 5 절차 Procedure > 5.1 품질관리기준서의 구성 및 관리]
+
+품질관리기준서는 다음 항목을 포함한다...
+```
 
 ---
 
@@ -69,23 +165,24 @@ rag_chatbot/
 ├── README.md
 │
 ├── rag/                         # RAG 모듈
-│   ├── __init__.py
+│   ├── __init__.py              # 패키지 초기화
 │   ├── document_pipeline.py     # 🔥 LangGraph 파이프라인 (핵심)
 │   ├── document_processor.py    # v8.0 선형 파이프라인 (폴백)
-│   ├── document_loader.py       # 문서 로더 (그래프용)
+│   ├── document_loader.py       # 문서 로더 (Neo4j 그래프용)
 │   ├── chunker.py               # 청킹 유틸리티
 │   ├── prompt.py                # RAG 프롬프트 템플릿
 │   ├── vector_store.py          # ChromaDB 벡터 스토어
 │   ├── graph_store.py           # Neo4j 그래프 스토어
-│   └── llm.py                   # LLM 연동 (Ollama)
+│   └── llm.py                   # LLM 연동 (Ollama/HuggingFace)
 │
 ├── frontend/                    # React 프론트엔드
 │   ├── src/
 │   │   ├── App.tsx
+│   │   ├── App.css
 │   │   └── ...
 │   └── package.json
 │
-└── chroma_db/                   # 벡터 DB 저장소
+└── chroma_db/                   # 벡터 DB 저장소 (자동 생성)
 ```
 
 ---
@@ -97,6 +194,13 @@ rag_chatbot/
 ```bash
 pip install -r requirements.txt
 ```
+
+**주요 의존성:**
+- `langgraph` - 상태 머신 파이프라인
+- `pdfplumber`, `PyMuPDF`, `PyPDF2` - PDF 파싱
+- `python-docx` - DOCX 파싱
+- `chromadb` - 벡터 스토어
+- `neo4j` - 그래프 DB (선택)
 
 ### 2. 서버 실행
 
@@ -128,11 +232,10 @@ POST /rag/upload
 |----------|------|--------|------|
 | file | File | 필수 | 업로드할 문서 |
 | collection | string | "documents" | 컬렉션 이름 |
-| chunk_size | int | 500 | 청크 크기 |
-| chunk_method | string | "article" | 청킹 방법 |
-| model | string | "multilingual-e5-small" | 임베딩 모델 |
+| chunk_size | int | 200 | 청크 크기 |
 | overlap | int | 50 | 청크 오버랩 |
-| use_langgraph | bool | true | LangGraph 사용 여부 |
+| model | string | "multilingual-e5-small" | 임베딩 모델 |
+| use_langgraph | bool | true | 🔥 LangGraph 사용 여부 |
 
 **응답:**
 ```json
@@ -158,21 +261,35 @@ POST /rag/search
 {
   "query": "품질관리기준서의 목적은?",
   "collection": "documents",
-  "top_k": 5
+  "n_results": 5
 }
 ```
 
 ### 챗봇
 
 ```http
-POST /rag/chat
+POST /chat
 ```
 
 ```json
 {
-  "message": "품질관리기준서란 무엇인가요?",
+  "message": "품질관리책임자의 역할은?",
   "collection": "documents",
-  "model": "gemma3:4b"
+  "llm_model": "qwen2.5:3b"
+}
+```
+
+### RAG 답변
+
+```http
+POST /rag/ask
+```
+
+```json
+{
+  "query": "변경관리 절차를 설명해주세요",
+  "collection": "documents",
+  "check_clarification": true
 }
 ```
 
@@ -196,10 +313,15 @@ POST /rag/chat
 
 ### PDF (헤더 추론 적용)
 
+PDF는 스타일 정보가 없으므로 패턴 기반 헤더 추론:
+
 | 추출된 텍스트 | 변환 후 |
 |--------------|---------|
 | `1 목적 Purpose` | `## 1 목적 Purpose` |
 | `1.1 본 규정은...` | `### 1.1 본 규정은...` |
+| `1.1.1 세부 항목` | `#### 1.1.1 세부 항목` |
+
+**무시되는 패턴:** 페이지 번호 (`1 of 11`), 헤더/푸터
 
 ---
 
@@ -214,11 +336,21 @@ POST /rag/chat
 | `EQ-SOP-00009.docx` | 숫자 없음 (`절차 Procedure`) |
 | `EQ-SOP-00009.pdf` | 숫자 있음 (`5 절차 Procedure`) |
 
-> 파싱 결과는 원본 문서의 내용을 그대로 반영합니다.
+> ⚡ 파싱 결과는 **원본 문서의 내용을 그대로 반영**합니다.
+
+### 파일명 확장자 감지
+
+v9.0에서는 **실제 확장자**를 기준으로 파일 타입을 결정합니다:
+
+```python
+# ✅ 올바른 감지
+"report_docx.pdf" → PDF로 처리
+"data.backup.xlsx" → XLSX로 처리
+```
 
 ### PDF 파싱 제한
 
-- ❌ 스캔된 이미지 PDF (OCR 필요)
+- ❌ 스캔된 이미지 PDF (OCR 필요 - pytesseract 설치 시 지원)
 - ⚠️ 복잡한 레이아웃 (텍스트 순서 섞임 가능)
 - ⚠️ 헤더 추론 (패턴 기반, 100% 정확하지 않음)
 
@@ -226,16 +358,54 @@ POST /rag/chat
 
 ## 🔄 버전 히스토리
 
-| 버전 | 주요 변경 |
-|------|----------|
-| **v9.0** | LangGraph 상태 머신 파이프라인 |
-| v8.1 | 컨텍스트 프리픽스, 테이블 보존 |
-| v8.0 | 4단계 마크다운 파이프라인 |
-| v7.0 | 소제목 패턴 확장, 확장자 버그 수정 |
-| v6.3 | section_path 지원 |
+| 버전 | 날짜 | 주요 변경 |
+|------|------|----------|
+| **v9.0** | 2025-01 | 🔥 LangGraph 상태 머신 파이프라인, 조건부 분기, 품질 검증 |
+| v8.1 | 2025-01 | 컨텍스트 프리픽스, 테이블 보존, 메타데이터 프롬프트 |
+| v8.0 | 2025-01 | 4단계 마크다운 파이프라인 (변환→분할→최적화→메타데이터) |
+| v7.0 | 2025-01 | 소제목 패턴 확장, 확장자 버그 수정, 문서 형식 자동 감지 |
+| v6.3 | 2025-01 | section_path 계층 추적, intro 블록 제외 |
+
+---
+
+## 🛠️ 트러블슈팅
+
+### PDF 업로드 실패: "File is not a zip file"
+
+**원인:** 파일명에 `docx`가 포함되어 DOCX로 잘못 인식
+
+**해결:** v9.0에서 실제 확장자 기준 감지로 수정됨
+
+### 청크가 0개
+
+**원인:** `exclude_intro=True`로 section_path 없는 청크 제외
+
+**해결:** 필터 없이 재시도하거나 `exclude_intro=False` 설정
+
+### LangGraph 미설치
+
+**해결:**
+```bash
+pip install langgraph
+```
+
+미설치 시 자동으로 v8.0 선형 파이프라인으로 폴백
 
 ---
 
 ## 📄 라이선스
 
 MIT License
+
+---
+
+## 🤝 기여
+
+이슈 및 PR 환영합니다!
+
+```bash
+git clone https://github.com/your-repo/rag-chatbot.git
+cd rag-chatbot
+pip install -r requirements.txt
+python main.py
+```
