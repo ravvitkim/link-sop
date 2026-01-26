@@ -1,0 +1,32 @@
+# Core
+fastapi
+uvicorn
+pydantic
+python-multipart    # 🔥 추가 - 파일 업로드에 필수!
+
+# ML/DL
+transformers
+sentence-transformers
+numpy
+scikit-learn
+
+# Vector Store
+chromadb
+
+# Document Parsing
+docling
+pymupdf
+python-docx
+beautifulsoup4
+lxml
+pdf2image
+rapidocr-onnxruntime    # 🔥 수정 - rapidocr → rapidocr-onnxruntime
+
+# Utilities
+requests
+
+# Optional: for xlsx/csv
+openpyxl
+pandas
+
+# pip install neo4j --break-system-packages
