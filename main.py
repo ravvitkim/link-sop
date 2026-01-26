@@ -1,11 +1,16 @@
 """
-RAG 챗봇 API v8.0
-- 🔥 새로운 4단계 파이프라인:
-  1. 변환: PDF, DOCX, HTML → Markdown
-  2. 분할: MarkdownHeaderTextSplitter로 헤더 기준 1차 분할
-  3. 최적화: RecursiveCharacterTextSplitter로 긴 섹션 재분할
-  4. 메타데이터: 상위 제목, 페이지 번호 등 저장
-- section_path: "5 절차 > 5.1 xxx > 5.1.1 xxx" 형식 지원
+RAG 챗봇 API v9.0
+
+🔥 LangGraph 상태 머신 기반 파이프라인:
+- 문서 타입별 분기 처리
+- 변환 실패 시 폴백 전략  
+- 품질 검증 및 자동 보정
+- 조건부 재처리
+
+노드 흐름:
+Load → Convert → Validate → Split → Optimize → Finalize
+         ↓           ↓
+      Fallback    Repair
 """
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -27,6 +32,7 @@ from rag import (
     CHUNK_METHODS,
 )
 from rag.document_processor import process_document  # 🔥 v8.0 새 파이프라인
+from rag.document_pipeline import process_document as process_document_v9, state_to_chunks  # 🔥 v9.0 LangGraph
 from rag import vector_store
 from rag.prompt import build_rag_prompt, build_chunk_prompt
 from rag.llm import (
@@ -39,7 +45,7 @@ from rag.llm import (
 )
 
 
-app = FastAPI(title="RAG Chatbot API", version="8.0.0")
+app = FastAPI(title="RAG Chatbot API", version="9.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -274,34 +280,54 @@ async def upload_document(
     chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
     model: str = Form("multilingual-e5-small"),
     overlap: int = Form(DEFAULT_OVERLAP),
-    exclude_intro: bool = Form(True),  # 🔥 v6.3: intro 블록 제외
+    exclude_intro: bool = Form(True),
+    use_langgraph: bool = Form(True),  # 🔥 v9.0: LangGraph 사용 여부
 ):
     start_time = time.time()
     try:
         content = await file.read()
         filename = file.filename
         
-        # 🔥 v8.0: 새 파이프라인 사용
-        # 1. 변환 → 2. 헤더 분할 → 3. 재분할 → 4. 메타데이터
-        result = process_document(
-            filename, 
-            content, 
-            chunk_size=chunk_size, 
-            chunk_overlap=overlap,
-            debug=True  # 콘솔 출력
-        )
-        
-        chunks = result.chunks
-        parsed_doc = result  # 호환성을 위해
+        # 🔥 v9.0: LangGraph 상태 머신 파이프라인
+        if use_langgraph:
+            result = process_document_v9(
+                filename, 
+                content, 
+                chunk_size=chunk_size, 
+                chunk_overlap=overlap,
+                debug=True
+            )
+            
+            # LangGraph 결과에서 청크 추출
+            chunks = state_to_chunks(result)
+            metadata = result.get("metadata", {})
+            quality_score = result.get("quality_score", 0)
+            conversion_method = result.get("conversion_method", "unknown")
+            warnings = result.get("warnings", [])
+            
+        else:
+            # v8.0 파이프라인 (폴백)
+            result = process_document(
+                filename, 
+                content, 
+                chunk_size=chunk_size, 
+                chunk_overlap=overlap,
+                debug=True
+            )
+            chunks = result.chunks
+            metadata = result.metadata
+            quality_score = 1.0
+            conversion_method = "v8-linear"
+            warnings = []
         
         # 목차/intro 제외 (선택적)
         if exclude_intro:
-            chunks = [c for c in chunks if c.metadata.get('section_path')]  # section_path 없는 것 제외
+            chunks = [c for c in chunks if c.metadata.get('section_path')]
         
         # 🔥 빈 청크 체크
         if not chunks:
             print(f"⚠️ 청크가 0개! 필터 없이 재시도")
-            chunks = result.chunks  # 원본 청크 사용
+            chunks = state_to_chunks(result) if use_langgraph else result.chunks
             
             if not chunks:
                 raise HTTPException(400, "문서에서 텍스트를 추출할 수 없습니다.")
@@ -314,18 +340,17 @@ async def upload_document(
         
         vector_store.add_documents(texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path)
         
-        # 🔥 Neo4j 그래프에도 자동 업로드 (호환성 위해 parsed_doc 생성)
+        # 🔥 Neo4j 그래프에도 자동 업로드
         graph_uploaded = False
         try:
             from rag.graph_store import document_to_graph, Neo4jGraphStore
             from rag.document_loader import load_document as load_doc_legacy
             
-            # 그래프용으로 기존 loader 사용
             parsed_doc_legacy = load_doc_legacy(filename, content)
             
             graph = get_graph_store()
             if graph.test_connection():
-                document_to_graph(graph, parsed_doc_legacy, result.metadata.get("sop_id"))
+                document_to_graph(graph, parsed_doc_legacy, metadata.get("sop_id"))
                 graph_uploaded = True
                 print(f"   ✅ Neo4j 그래프 업로드 완료")
         except Exception as graph_error:
@@ -334,13 +359,18 @@ async def upload_document(
         return {
             "success": True,
             "filename": filename,
-            "doc_title": result.metadata.get("sop_id") or filename,
-            "sop_id": result.metadata.get("sop_id"),
+            "doc_title": metadata.get("sop_id") or filename,
+            "sop_id": metadata.get("sop_id"),
             "chunks": len(chunks),
             "chunk_method": chunk_method,
             "elapsed_seconds": round(time.time() - start_time, 2),
             "sample_metadata": metadatas[0] if metadatas else {},
             "graph_uploaded": graph_uploaded,
+            # 🔥 v9.0 추가 정보
+            "pipeline_version": "v9.0-langgraph" if use_langgraph else "v8.0-linear",
+            "quality_score": quality_score,
+            "conversion_method": conversion_method,
+            "warnings": warnings,
         }
     except HTTPException:
         raise

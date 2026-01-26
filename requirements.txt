@@ -1,32 +1,27 @@
-# Core
+# RAG Chatbot v9.0 Dependencies
+
+# FastAPI 서버
 fastapi
 uvicorn
-pydantic
-python-multipart    # 🔥 추가 - 파일 업로드에 필수!
+python-multipart
 
-# ML/DL
-transformers
-sentence-transformers
-numpy
-scikit-learn
-
-# Vector Store
-chromadb
-
-# Document Parsing
-docling
-pymupdf
+# 문서 파싱
 python-docx
 beautifulsoup4
-lxml
-pdf2image
-rapidocr-onnxruntime    # 🔥 수정 - rapidocr → rapidocr-onnxruntime
 
-# Utilities
+# 벡터 스토어
+chromadb
+
+# 그래프 DB
+neo4j
+
+# 🔥 LangGraph 파이프라인
+langgraph
+
+# ML/임베딩
+# torch
+transformers
+numpy
+
+# 기타
 requests
-
-# Optional: for xlsx/csv
-openpyxl
-pandas
-
-# pip install neo4j --break-system-packages
