@@ -833,14 +833,14 @@ class Neo4jGraphStore:
     # ═══════════════════════════════════════════════════════════════════════════
     
     def get_graph_stats(self) -> Dict:
-        """그래프 통계"""
+        """그래프 통계 (없는 라벨도 처리)"""
         query = """
-        MATCH (d:Document) WITH count(d) as docs
-        MATCH (s:Section) WITH docs, count(s) as sections
-        MATCH (t:Term) WITH docs, sections, count(t) as terms
-        MATCH (r:Role) WITH docs, sections, terms, count(r) as roles
+        OPTIONAL MATCH (d:Document) WITH count(d) as docs
+        OPTIONAL MATCH (s:Section) WITH docs, count(s) as sections
+        OPTIONAL MATCH (t:Term) WITH docs, sections, count(t) as terms
+        OPTIONAL MATCH (r:Role) WITH docs, sections, terms, count(r) as roles
         OPTIONAL MATCH (q:Question) WITH docs, sections, terms, roles, count(q) as questions
-        MATCH ()-[rel]->() WITH docs, sections, terms, roles, questions, count(rel) as rels
+        OPTIONAL MATCH ()-[rel]->() WITH docs, sections, terms, roles, questions, count(rel) as rels
         RETURN docs, sections, terms, roles, questions, rels
         """
         
@@ -849,12 +849,12 @@ class Neo4jGraphStore:
             record = result.single()
             if record:
                 return {
-                    "documents": record["docs"],
-                    "sections": record["sections"],
-                    "terms": record["terms"],
-                    "roles": record["roles"],
-                    "questions": record["questions"],  # 🆕
-                    "relationships": record["rels"]
+                    "documents": record["docs"] or 0,
+                    "sections": record["sections"] or 0,
+                    "terms": record["terms"] or 0,
+                    "roles": record["roles"] or 0,
+                    "questions": record["questions"] or 0,
+                    "relationships": record["rels"] or 0
                 }
             return {}
 

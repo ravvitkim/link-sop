@@ -581,13 +581,13 @@ def search_advanced(request: SearchRequest):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """대화형 RAG 챗봇 (Question 추적 포함)"""
+    """대화형 RAG 챗봇 (v9.3 - 되묻기/추적 제거, 소스 형식 수정)"""
     session_id = request.session_id or str(uuid.uuid4())
     
     if session_id not in chat_histories:
         chat_histories[session_id] = []
     
-    # 검색
+    # 1. 벡터 검색
     model_path = resolve_model_path(request.embedding_model)
     threshold = request.similarity_threshold or DEFAULT_SIMILARITY_THRESHOLD
     
@@ -600,30 +600,23 @@ def chat(request: ChatRequest):
         similarity_threshold=threshold,
     )
     
-    # 되묻기 판단
-    analysis = analyze_search_results(results)
+    # 🔥 디버그 로그
+    print(f"\n{'='*50}")
+    print(f"🔍 질문: {request.message}")
+    print(f"📊 검색 결과: {len(results)}개")
+    if results:
+        for i, r in enumerate(results[:3]):
+            sim = r.get('similarity', 0)
+            meta = r.get('metadata', {})
+            sop = meta.get('sop_id', '?')
+            path = meta.get('section_path', '')[:40]
+            print(f"   [{i+1}] 유사도: {sim:.2f} | {sop} | {path}...")
+    print(f"📝 컨텍스트 길이: {len(context)} 글자")
     
-    if analysis["needs_clarification"] and len(analysis["options"]) > 1:
-        clarification = generate_clarification_question(
-            request.message,
-            analysis["options"],
-            request.llm_model,
-            request.llm_backend
-        )
-        
-        chat_histories[session_id].append({"role": "user", "content": request.message})
-        chat_histories[session_id].append({"role": "assistant", "content": clarification})
-        
-        return {
-            "session_id": session_id,
-            "needs_clarification": True,
-            "clarification": clarification,
-            "options": analysis["options"],
-            "sources": []
-        }
-    
-    # LLM 답변 생성
+    # 2. LLM 답변 생성
     prompt = build_rag_prompt(request.message, context)
+    print(f"🤖 LLM 호출: {request.llm_model}")
+    
     answer = get_llm_response(
         prompt=prompt,
         llm_model=request.llm_model,
@@ -631,44 +624,38 @@ def chat(request: ChatRequest):
         max_tokens=512
     )
     
+    print(f"💬 답변 길이: {len(answer)} 글자")
+    print(f"{'='*50}\n")
+    
     # 히스토리 저장
     chat_histories[session_id].append({"role": "user", "content": request.message})
     chat_histories[session_id].append({"role": "assistant", "content": answer})
     
-    # 🔥 Question 추적 (Neo4j)
-    question_id = None
-    try:
-        from rag.graph_store import track_rag_question
-        graph = get_graph_store()
-        if graph.test_connection():
-            question_id = track_rag_question(
-                graph_store=graph,
-                question_text=request.message,
-                search_results=results,
-                answer=answer,
-                session_id=session_id,
-                embedding_model=request.embedding_model,
-                llm_model=request.llm_model
-            )
-    except Exception as e:
-        print(f"⚠️ Question 추적 실패: {e}")
-    
-    # 소스 정보
-    sources = [
-        {
-            "sop_id": r.get("metadata", {}).get("sop_id"),
-            "section_path": r.get("metadata", {}).get("section_path"),
-            "page": r.get("metadata", {}).get("page"),
-            "similarity": r.get("similarity"),
-        }
-        for r in results
-    ]
+    # 🔥 소스 정보 (프론트엔드 형식에 맞춤)
+    sources = []
+    for r in results:
+        meta = r.get("metadata", {})
+        sources.append({
+            "text": r.get("text", ""),
+            "similarity": r.get("similarity", 0),
+            "metadata": meta,
+            "metadata_display": {
+                "doc_name": meta.get("doc_name", "문서"),
+                "doc_title": meta.get("doc_title", ""),
+                "sop_id": meta.get("sop_id", ""),
+                "version": meta.get("version", ""),
+                "section": meta.get("section", ""),
+                "section_path": meta.get("section_path", ""),
+                "section_path_readable": meta.get("section_path_readable", ""),
+                "title": meta.get("title", ""),
+                "page": meta.get("page", ""),
+            }
+        })
     
     return {
         "session_id": session_id,
         "answer": answer,
         "sources": sources,
-        "question_id": question_id,
         "needs_clarification": False
     }
 
