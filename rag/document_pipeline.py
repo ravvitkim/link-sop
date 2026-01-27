@@ -81,6 +81,8 @@ def extract_document_metadata(text: str, filename: str) -> Dict:
     """
     문서 헤더에서 메타데이터 추출
     
+    🔥 v9.2: 파일명에서 SOP ID 우선 추출
+    
     Returns:
         {
             "sop_id": "EQ-SOP-00010",
@@ -93,12 +95,19 @@ def extract_document_metadata(text: str, filename: str) -> Dict:
     """
     metadata = {"file_name": filename}
     
-    # SOP ID
-    sop_match = re.search(r'Number:\s*(EQ-SOP-\d+)', text)
-    if not sop_match:
-        sop_match = re.search(r'(EQ-SOP-\d+)', text)
-    if sop_match:
-        metadata["sop_id"] = sop_match.group(1)
+    # 🔥 SOP ID - 파일명 우선!
+    # 1순위: 파일명에서 추출
+    filename_sop = re.search(r'(EQ-SOP-\d+)', filename, re.IGNORECASE)
+    if filename_sop:
+        metadata["sop_id"] = filename_sop.group(1).upper()
+    else:
+        # 2순위: 문서 헤더 "Number:" 필드
+        sop_match = re.search(r'Number:\s*(EQ-SOP-\d+)', text)
+        if not sop_match:
+            # 3순위: 문서 내용에서 첫 번째 발견
+            sop_match = re.search(r'(EQ-SOP-\d+)', text)
+        if sop_match:
+            metadata["sop_id"] = sop_match.group(1).upper()
     
     # Version
     ver_match = re.search(r'Version:\s*(\d+\.\d+)', text)
