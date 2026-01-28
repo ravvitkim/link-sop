@@ -10,6 +10,7 @@ GMP/SOP 에이전트 모듈 v1.0
 import os
 from typing import List, Dict, Optional, Any, Annotated, TypedDict
 from datetime import datetime
+import operator
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LangSmith 설정 (맨 위에서 설정해야 함)
@@ -323,35 +324,33 @@ AGENT_TOOLS = [
 
 # 시스템 프롬프트
 AGENT_SYSTEM_PROMPT = """당신은 GMP(의약품 제조 및 품질관리) 규정 전문가 AI 에이전트입니다.
+반드시 아래의 **구조화된 답변 형식**을 준수하여 한국어로 답변하세요.
 
-## 역할
-사용자의 질문에 대해 SOP(표준작업절차서) 문서를 검색하고 정확한 답변을 제공합니다.
+## 답변 형식 (필수)
+1. **검증 의견**: 질문에 대한 결론과 전문적인 분석 내용을 상세히 서술합니다.
+2. **검증 근거 및 출처**: 
+   - 각 근거별로 숫자를 매겨 제목(`**1. 제목**`)을 작성합니다.
+   - 해당 근거에 대한 상세 설명을 불렛 포인트로 작성합니다.
+   - 마지막에는 반드시 `**[출처]** [SOP ID] > [장/절 제목] > [상세 문구 인용] (p.페이지)` 형식을 지킵니다.
 
-## 사용 가능한 도구
-1. **search_sop_documents**: SOP 문서 내용 검색 (의미 기반)
-2. **get_document_references**: 문서 간 참조 관계 조회
-3. **search_sections_by_keyword**: 키워드로 섹션 검색
-4. **get_document_structure**: 문서 목차/구조 조회
-5. **list_all_documents**: 전체 문서 목록 조회
-
-## 답변 원칙
-1. 반드시 도구를 사용해서 검색한 후 답변하세요.
-2. 출처(SOP ID, 섹션)를 명확히 밝히세요.
-3. 검색 결과가 없으면 솔직히 말하세요.
-4. 추측하지 말고 문서 내용만 기반으로 답변하세요.
-
-## 도구 선택 가이드
-- 일반적인 질문 → search_sop_documents
-- "참조하는 문서", "관련 규정" → get_document_references
-- 특정 용어/키워드 위치 → search_sections_by_keyword
-- 문서 구성/목차 → get_document_structure
-- 어떤 문서가 있는지 → list_all_documents
+## 핵심 규칙
+1. **상세성**: 단순히 짧게 대답하지 말고, 규정의 맥락을 충분히 설명하세요.
+2. **근거 중심**: 모든 주장은 반드시 검색된 SOP의 구체적인 조항에 기반해야 합니다.
+3. **객관성**: 추측을 배제하고 문서에 명시된 사실만을 전달하세요.
 """
 
 
 class AgentState(TypedDict):
-    """에이전트 상태"""
-    messages: List[Any]
+    """멀티 에이전트 공유 상태"""
+    messages: Annotated[List[Any], operator.add]
+    query: str
+    next_node: str
+    search_results: List[Dict]
+    verification: str
+    answer: str
+    tool_calls: List[Dict]
+    session_id: str
+    model_name: str
     
 
 # 메모리 (대화 히스토리 유지)
@@ -383,281 +382,239 @@ def create_agent(model_name: str = "glm-4.7-flash"):
     return _agent
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 멀티 에이전트 노드 구현
+# ═══════════════════════════════════════════════════════════════════════════
+
+def orchestrator_node(state: AgentState):
+    """의도 분석 및 작업 분배 노드"""
+    query = state["query"]
+    model_name = state["model_name"]
+    client = _agent["client"]
+    
+    print(f"🎯 [Orchestrator] 의도 분석 중: {query}")
+    
+    prompt = f"""당신은 GMP 규정 시스템의 오케스트레이터입니다. 사용자의 질문을 분석하여 다음 단계(next_node)를 결정하세요.
+    - search_agent: 규정 검색이 필요한 경우
+    - verifier_agent: 특정 상황이나 행위가 규정에 맞는지 검착/검증이 필요한 경우 (검색 결과가 이미 있다면)
+    - list_agent: 문서 목록 조회가 필요한 경우
+    - writer_agent: 이미 충분한 정보가 있어 답변을 생성하면 되는 경우
+
+    현재 질문: {query}
+    응답 형식: [노드이름]
+    예: search_agent"""
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=50,
+        temperature=0.1
+    )
+    
+    next_node = response.choices[0].message.content.strip().lower()
+    if "search" in next_node: next_node = "search_agent"
+    elif "verify" in next_node or "검증" in next_node: next_node = "verifier_agent"
+    elif "list" in next_node: next_node = "list_agent"
+    else: next_node = "search_agent" # 기본값
+
+    return {"next_node": next_node}
+
+
+def search_agent_node(state: AgentState):
+    """검색 전문 에이전트 노드"""
+    query = state["query"]
+    print(f"🔍 [SearchAgent] 규정 검색 시도: {query}")
+    
+    # 벡터 검색 및 그래프 검색 통합 사용
+    results = search_sop_documents.invoke(query)
+    
+    # 질문에 '맞는지', '적절한지' 등의 키워드가 있으면 검증 노드로 유도
+    should_verify = any(kw in query for kw in ["맞는지", "적절한지", "가능한지", "위반", "검증", "의견"])
+    
+    return {
+        "search_results": [{"content": results}],
+        "next_node": "verifier_agent" if should_verify else "writer_agent"
+    }
+
+
+def verifier_agent_node(state: AgentState):
+    """규정 검증 및 최종 답변 생성 노드 (통합)"""
+    query = state["query"]
+    search_results = state.get("search_results", [])
+    context = "\n".join([r["content"] for r in search_results]) if search_results else "참조할 규정 검색 결과가 없습니다."
+    
+    model_name = state["model_name"]
+    client = _agent["client"]
+    
+    print(f"⚖️ [VerifierAgent] 규정 검증 및 답변 생성 중")
+    
+    prompt = f"""{AGENT_SYSTEM_PROMPT}
+
+[규정 컨텍스트]
+{context}
+
+[사용자 질문]
+{query}
+
+위 규정을 면밀히 분석하여, 이미지와 같이 **상세하고 전문적인 검증 결과**를 작성하세요. 
+규정 조항의 문구를 직접 인용하며 설득력 있는 답변을 제공해야 합니다.
+"""
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2500,
+        temperature=0.3
+    )
+    
+    msg_obj = response.choices[0].message
+    content = getattr(msg_obj, 'content', "") or ""
+    reasoning = getattr(msg_obj, 'reasoning_content', "") or ""
+    
+    final_answer = content if content else (f"[분석 내용]\n{reasoning}" if reasoning else "[오류] 답변을 생성하지 못했습니다.")
+    
+    return {"answer": final_answer, "reasoning": reasoning, "next_node": "end"}
+
+
+def list_agent_node(state: AgentState):
+    """문서 목록 조회 전문 에이전트 노드"""
+    print(f"📚 [ListAgent] 전체 문서 목록 조회 중")
+    docs_info = list_all_documents.invoke({})
+    return {"search_results": [{"content": docs_info}], "next_node": "writer_agent"}
+
+
+def writer_agent_node(state: AgentState):
+    """일반 답변 생성 노드 (통합)"""
+    query = state["query"]
+    search_results = state.get("search_results", [])
+    context = "\n".join([r["content"] for r in search_results]) if search_results else "검색 결과 없음"
+    model_name = state["model_name"]
+    client = _agent["client"]
+    
+    print(f"✍️ [WriterAgent] 일반 답변 작성 중")
+    
+    prompt = f"""{AGENT_SYSTEM_PROMPT}
+
+[참고 규정]
+{context}
+
+[사용자 질문]
+{query}
+
+위 규정을 바탕으로 질문에 대해 **충분한 설명과 구체적인 출처**를 포함하여 답변을 작성하세요.
+이미지의 형식(`**검증 의견**`, `**검증 근거 및 출처**`)을 엄격히 준수하세요.
+"""
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2500,
+        temperature=0.7
+    )
+    
+    msg_obj = response.choices[0].message
+    content = getattr(msg_obj, 'content', "") or ""
+    reasoning = getattr(msg_obj, 'reasoning_content', "") or ""
+    
+    final_answer = content if content else (f"[분석 내용]\n{reasoning}" if reasoning else "[오류] 답변을 생성하지 못했습니다.")
+
+    return {"answer": final_answer, "reasoning": reasoning, "next_node": "end"}
+
+
 def run_agent(
     query: str,
     session_id: str = "default",
     model_name: str = "glm-4.7-flash"
 ) -> Dict[str, Any]:
-    """
-    Z.AI 에이전트 실행 (ReAct 스타일)
-    
-    Args:
-        query: 사용자 질문
-        session_id: 세션 ID
-        model_name: Z.AI 모델명
-    
-    Returns:
-        {
-            "answer": "답변 텍스트",
-            "tool_calls": [...],
-            "session_id": "세션ID"
-        }
-    """
+    """멀티 에이전트 워크플로우 실행 (노드 기반 시뮬레이션)"""
     global _agent
     
     # 에이전트가 없으면 생성
     if _agent is None:
         create_agent(model_name)
     
-    client = _agent["client"]
-    tool_calls = []
-    context_parts = []
-    
-    print(f"🔄 Z.AI 에이전트 실행 중... ({model_name})")
+    # 초기 상태
+    state: AgentState = {
+        "messages": [],
+        "query": query,
+        "next_node": "orchestrator",
+        "search_results": [],
+        "verification": "",
+        "answer": "",
+        "tool_calls": [],
+        "session_id": session_id,
+        "model_name": model_name
+    }
     
     try:
-        # 1. 먼저 LLM에게 도구 선택을 요청
-        tool_selection_prompt = f"""{AGENT_SYSTEM_PROMPT}
+        # 1. Orchestrator
+        res = orchestrator_node(state)
+        state.update(res)
+        
+        # 2. Search (필요 시)
+        if state["next_node"] == "search_agent":
+            res = search_agent_node(state)
+            state.update(res)
+            state["tool_calls"].append({"tool": "search_sop_documents", "input": query})
+        
+        # 3. List (필요 시)
+        elif state["next_node"] == "list_agent":
+            res = list_agent_node(state)
+            state.update(res)
+            state["tool_calls"].append({"tool": "list_all_documents", "input": ""})
+            # ListAgent에서 바로 결과가 나오므로 Writer 호출 불필요 (현재 구현상)
+            state["answer"] = res.get("search_results", [{}])[0].get("content", "")
+            state["next_node"] = "end"
 
-사용자 질문: {query}
-
-위 질문에 답하려면 어떤 도구를 사용해야 하는지 판단하세요.
-도구 이름만 짧게 응답하세요:
-- search_sop_documents: 일반적인 내용 검색
-- get_document_references: 문서 간 참조 관계
-- search_sections_by_keyword: 키워드로 섹션 검색
-- get_document_structure: 문서 목차/구조
-- list_all_documents: 전체 문서 목록
-
-응답 형식: [도구이름]
-예: search_sop_documents"""
-
-        tool_response = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": tool_selection_prompt}],
-            max_tokens=100,
-            temperature=0.1,
-        )
-        
-        tool_msg = tool_response.choices[0].message
-        selected_tool = getattr(tool_msg, 'content', "") or ""
-        
-        # '생각' 모드로 인해 content가 비어있을 경우 대응
-        if not selected_tool:
-            reasoning = getattr(tool_msg, 'reasoning_content', "").lower()
-            selected_tool = "search_sop_documents" if "search" in reasoning or "검색" in reasoning else "search_sop_documents"
-        
-        selected_tool = selected_tool.strip().lower()
-        print(f"🔧 선택된 도구: {selected_tool}")
-        
-        # 2. 도구 실행
-        tool_result = ""
-        
-        if "search_sop_documents" in selected_tool or "검색" in selected_tool:
-            tool_result = search_sop_documents.invoke(query)
-            tool_calls.append({"tool": "search_sop_documents", "input": query, "output": tool_result[:300]})
-            
-        elif "references" in selected_tool or "참조" in selected_tool:
-            import re
-            sop_match = re.search(r'(EQ-?SOP-?\d+)', query, re.IGNORECASE)
-            if sop_match:
-                sop_id = sop_match.group(1).upper()
-                tool_result = get_document_references.invoke(sop_id)
-                tool_calls.append({"tool": "get_document_references", "input": sop_id, "output": tool_result[:300]})
-            else:
-                tool_result = search_sop_documents.invoke(query)
-                tool_calls.append({"tool": "search_sop_documents", "input": query, "output": tool_result[:300]})
-                
-        elif "keyword" in selected_tool or "키워드" in selected_tool:
-            # 주요 키워드 추출
-            keywords = query.replace("?", "").replace("은", "").replace("는", "").split()[-1]
-            tool_result = search_sections_by_keyword.invoke(keywords)
-            tool_calls.append({"tool": "search_sections_by_keyword", "input": keywords, "output": tool_result[:300]})
-            
-        elif "structure" in selected_tool or "구조" in selected_tool or "목차" in selected_tool:
-            import re
-            sop_match = re.search(r'(EQ-?SOP-?\d+)', query, re.IGNORECASE)
-            if sop_match:
-                sop_id = sop_match.group(1).upper()
-                tool_result = get_document_structure.invoke(sop_id)
-                tool_calls.append({"tool": "get_document_structure", "input": sop_id, "output": tool_result[:300]})
-            else:
-                tool_result = list_all_documents.invoke({})
-                tool_calls.append({"tool": "list_all_documents", "input": "", "output": tool_result[:300]})
-                
-        elif "list" in selected_tool or "목록" in selected_tool:
-            tool_result = list_all_documents.invoke({})
-            tool_calls.append({"tool": "list_all_documents", "input": "", "output": tool_result[:300]})
-            
-        else:
-            # 기본: 검색
-            tool_result = search_sop_documents.invoke(query)
-            tool_calls.append({"tool": "search_sop_documents", "input": query, "output": tool_result[:300]})
-        
-        print(f"📄 도구 결과 길이: {len(tool_result)} 글자")
-        
-        # 3. 최종 답변 생성
-        final_prompt = f"""{AGENT_SYSTEM_PROMPT}
-
-[검색 결과]
-{tool_result}
-
-[사용자 질문]
-{query}
-
-위 검색 결과를 바탕으로 질문에 정확히 답변하세요.
-반드시 출처(SOP ID, 섹션)를 명시하세요."""
-
-        final_response = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": final_prompt}],
-            max_tokens=2048,  # 토큰 상향
-            temperature=0.7,
-        )
-        
-        msg_obj = final_response.choices[0].message
-        answer = getattr(msg_obj, 'content', "") or ""
-        reasoning = getattr(msg_obj, 'reasoning_content', "") or ""
-        
-        if not answer and reasoning:
-            answer = f"[분석 내용]\n{reasoning}\n\n⚠️ 답변 생성 중 토큰 제한으로 중단되었습니다."
-            
-        print(f"✅ 최종 답변 길이: {len(answer)} 글자")
+        # 4. Verifier / Writer (분기하여 하나만 실행)
+        if state["next_node"] == "verifier_agent":
+            res = verifier_agent_node(state)
+            state.update(res)
+            state["tool_calls"].append({"tool": "verifier_agent", "input": "compliance_check"})
+        elif state["next_node"] == "writer_agent":
+            res = writer_agent_node(state)
+            state.update(res)
         
         return {
-            "answer": answer,
-            "tool_calls": tool_calls,
+            "answer": state["answer"],
+            "tool_calls": state["tool_calls"],
             "session_id": session_id,
-            "success": True
+            "success": True,
+            "reasoning": state.get("reasoning", "")
         }
-    
+        
     except Exception as e:
         import traceback
         traceback.print_exc()
         return {
-            "answer": f"Z.AI 에이전트 실행 오류: {str(e)}",
-            "tool_calls": [],
+            "answer": f"❌ 멀티 에이전트 실행 중 오류: {str(e)}",
+            "tool_calls": state.get("tool_calls", []),
             "session_id": session_id,
             "success": False
         }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 간단한 폴백 에이전트 (LangGraph 없이)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_simple_agent(
-    query: str,
-    vector_store_module,
-    graph_store_instance,
-    llm_model: str = "qwen2.5:3b"
-) -> Dict[str, Any]:
-    """
-    간단한 규칙 기반 에이전트 (LangGraph 없이 동작)
-    
-    키워드 기반으로 도구 선택
-    """
-    from rag.llm import get_llm_response
-    
-    tool_calls = []
-    context_parts = []
-    
-    query_lower = query.lower()
-    
-    # 1. 문서 목록 질문
-    if any(kw in query_lower for kw in ["문서 목록", "어떤 문서", "등록된 문서", "sop 목록"]):
-        try:
-            docs = graph_store_instance.get_all_documents()
-            result = "\n".join([f"• {d['sop_id']}: {d.get('title', '')}" for d in docs])
-            context_parts.append(f"📚 등록된 문서:\n{result}")
-            tool_calls.append({"tool": "list_all_documents", "result": result[:200]})
-        except Exception as e:
-            context_parts.append(f"문서 목록 조회 실패: {e}")
-    
-    # 2. 참조 관계 질문
-    elif any(kw in query_lower for kw in ["참조", "관련 문서", "연관", "관계"]):
-        import re
-        sop_match = re.search(r'(EQ-?SOP-?\d+)', query, re.IGNORECASE)
-        if sop_match:
-            sop_id = sop_match.group(1).upper().replace("SOP", "-SOP-").replace("--", "-")
-            try:
-                refs = graph_store_instance.get_document_references(sop_id)
-                if refs:
-                    context_parts.append(f"📄 {sop_id} 참조 관계:\n- 참조: {refs.get('references', [])}\n- 피참조: {refs.get('cited_by', [])}")
-                    tool_calls.append({"tool": "get_document_references", "input": sop_id})
-            except:
-                pass
-    
-    # 3. 문서 구조 질문
-    elif any(kw in query_lower for kw in ["목차", "구조", "구성", "섹션"]):
-        import re
-        sop_match = re.search(r'(EQ-?SOP-?\d+)', query, re.IGNORECASE)
-        if sop_match:
-            sop_id = sop_match.group(1).upper().replace("SOP", "-SOP-").replace("--", "-")
-            try:
-                hierarchy = graph_store_instance.get_section_hierarchy(sop_id)
-                if hierarchy:
-                    sections = [h['section']['name'] for h in hierarchy[:10]]
-                    context_parts.append(f"📋 {sop_id} 구조:\n" + "\n".join([f"• {s}" for s in sections]))
-                    tool_calls.append({"tool": "get_document_structure", "input": sop_id})
-            except:
-                pass
-    
-    # 4. 기본: 벡터 검색
-    if not context_parts:
-        try:
-            results = vector_store_module.search(
-                query=query,
-                collection_name="documents",
-                model_name="intfloat/multilingual-e5-small",
-                n_results=3
-            )
-            for r in results:
-                meta = r.get("metadata", {})
-                sop = meta.get("sop_id", "")
-                path = meta.get("section_path", "")
-                text = r.get("text", "")[:400]
-                context_parts.append(f"[{sop}] {path}\n{text}")
-            tool_calls.append({"tool": "search_sop_documents", "input": query})
-        except Exception as e:
-            context_parts.append(f"검색 실패: {e}")
-    
-    # LLM 답변 생성
-    context = "\n\n---\n\n".join(context_parts)
-    
-    prompt = f"""당신은 GMP/SOP 규정 전문가입니다. 아래 검색 결과를 바탕으로 질문에 답변하세요.
-
-[검색 결과]
-{context}
-
-[질문]
-{query}
-
-[답변] (출처를 명시하세요):"""
-    
-    answer = get_llm_response(prompt, llm_model=llm_model, max_tokens=512)
-    
-    return {
-        "answer": answer,
-        "tool_calls": tool_calls,
-        "context": context[:500],
-        "success": True
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 테스트
+# 테스트 및 사용법
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("🤖 GMP/SOP 에이전트 테스트")
+    print("🤖 멀티 에이전트 시스템 테스트 (v11.0)")
     print("="*60)
     
-    # 테스트 (도구 초기화 없이 구조만 확인)
-    print("\n📋 등록된 도구:")
-    for tool in AGENT_TOOLS:
-        print(f"  • {tool.name}: {tool.description[:50]}...")
+    # 에이전트 모듈 및 노드 로드 상태 확인
+    print("\n✅ 에이전트 모듈 및 노드 로드 완료!")
+    print(f"   - 오케스트레이터: {orchestrator_node.__name__}")
+    print(f"   - 검색 에이전트: {search_agent_node.__name__}")
+    print(f"   - 검증 에이전트: {verifier_agent_node.__name__}")
+    print(f"   - 라이터 에이전트: {writer_agent_node.__name__}")
     
-    print("\n✅ 에이전트 모듈 로드 완료!")
-    print("   사용법: from agent import run_agent, init_agent_tools")
+    # 사용법 안내
+    print("\n💡 사용법:")
+    print("   from rag.agent import run_agent, init_agent_tools")
+    print("   init_agent_tools(vector_store, graph_store)")
+    print("   # 예시 호출:")
+    print("   # result = run_agent(\"품질관리책임자의 역할이 뭐야? 규정에 맞는지 검증해줘.\")")
+    print("   # print(result['answer'])")
+    print("="*60)

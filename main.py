@@ -1094,7 +1094,6 @@ try:
     from rag.agent import (
         init_agent_tools, 
         run_agent, 
-        run_simple_agent,
         create_agent,
         AGENT_TOOLS,
         LANGCHAIN_AVAILABLE,
@@ -1146,21 +1145,12 @@ def agent_chat(request: AgentRequest):
         # 도구 초기화 (처음 한 번만)
         init_agent_tools(vector_store, get_graph_store())
         
-        if request.use_langgraph and LANGGRAPH_AGENT_AVAILABLE:
-            # LangGraph 에이전트
-            result = run_agent(
-                query=request.message,
-                session_id=session_id,
-                model_name=request.llm_model
-            )
-        else:
-            # 간단한 규칙 기반 에이전트
-            result = run_simple_agent(
-                query=request.message,
-                vector_store_module=vector_store,
-                graph_store_instance=get_graph_store(),
-                llm_model=request.llm_model
-            )
+        # 통합된 멀티 에이전트 워크플로우 실행
+        result = run_agent(
+            query=request.message,
+            session_id=session_id,
+            model_name=request.llm_model
+        )
         
         reasoning = result.get("reasoning")
         answer = result.get("answer", "")
