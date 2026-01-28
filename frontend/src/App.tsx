@@ -61,29 +61,31 @@ function App() {
   const [inputMessage, setInputMessage] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [sessionId, setSessionId] = useState<string | null>(null)
-  
+
   // 문서 상태
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
   const [uploadStatus, setUploadStatus] = useState('')
   const [uploadLoading, setUploadLoading] = useState(false)
-  
+
   // 🔥 마크다운 미리보기 상태
   const [previewMarkdown, setPreviewMarkdown] = useState('')
   const [previewFilename, setPreviewFilename] = useState('')
   const [showPreview, setShowPreview] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
-  
+
   // 설정 상태
   const [showSettings, setShowSettings] = useState(false)
   const [showSources, setShowSources] = useState(true)
   const [embeddingModel, setEmbeddingModel] = useState('multilingual-e5-small')
-  const [llmModel, setLlmModel] = useState('qwen2.5:3b')
+  const [llmModel, setLlmModel] = useState('glm-4.7-flash')
+  const [llmBackend, setLlmBackend] = useState('zai') // 🔥 백엔드 상태 추가
   const [chunkMethod, setChunkMethod] = useState('article')
-  const [nResults, setNResults] = useState(3)  // 🔥 참고 문서 수
-  
+  const [nResults, setNResults] = useState(7)  // 🔥 참고 문서 수 (3 -> 7 상향)
+  const [agentMode, setAgentMode] = useState(false)  // 🤖 에이전트 모드
+
   // 소스 확장 상태
   const [expandedSources, setExpandedSources] = useState<Set<number>>(new Set())
-  
+
   const chatEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -211,22 +213,34 @@ function App() {
     setIsLoading(true)
 
     try {
-      const response = await fetch(`${API_URL}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // 🤖 에이전트 모드 vs 일반 RAG 분기
+      const endpoint = agentMode ? `${API_URL}/agent/chat` : `${API_URL}/chat`
+      const requestBody = agentMode
+        ? {
+          message: inputMessage,
+          session_id: sessionId,
+          llm_model: llmModel,
+          use_langgraph: true,
+        }
+        : {
           message: inputMessage,
           session_id: sessionId,
           embedding_model: embeddingModel,
           llm_model: llmModel,
+          llm_backend: llmBackend, // 🔥 백엔드 정보 포함
           include_sources: showSources,
-          n_results: nResults,  // 🔥 참고 문서 수
-        }),
+          n_results: nResults,
+        }
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
       })
 
       if (response.ok) {
         const data = await response.json()
-        
+
         if (!sessionId) {
           setSessionId(data.session_id)
         }
@@ -234,7 +248,7 @@ function App() {
         const assistantMessage: ChatMessage = {
           role: 'assistant',
           content: data.answer,
-          sources: data.sources,
+          sources: agentMode ? [] : data.sources,  // 에이전트 모드는 sources 없음
           timestamp: new Date(),
         }
 
@@ -264,7 +278,7 @@ function App() {
     if (sessionId) {
       try {
         await fetch(`${API_URL}/chat/history/${sessionId}`, { method: 'DELETE' })
-      } catch {}
+      } catch { }
     }
     setMessages([])
     setSessionId(null)
@@ -306,7 +320,7 @@ function App() {
             {meta.section && <span className="source-section">{meta.section}</span>}
           </div>
           <div className="source-meta">
-            <span 
+            <span
               className="similarity-badge"
               style={{ backgroundColor: getSimilarityColor(source.similarity) }}
             >
@@ -315,7 +329,7 @@ function App() {
             <span className="expand-icon">{isExpanded ? '▼' : '▶'}</span>
           </div>
         </div>
-        
+
         {/* 🔥 section_path를 헤더 바로 아래에 항상 표시 (펼치지 않아도) */}
         {(meta.section_path_readable || meta.section_path) && (
           <div className="section-path-preview">
@@ -323,7 +337,7 @@ function App() {
             <span className="path-text">{meta.section_path_readable || meta.section_path}</span>
           </div>
         )}
-        
+
         {isExpanded && (
           <div className="source-details">
             {meta.title && (
@@ -331,9 +345,9 @@ function App() {
                 <strong>제목:</strong> {meta.title}
               </div>
             )}
-            
+
             <div className="source-text">{source.text}</div>
-            
+
             {/* 전체 메타데이터 */}
             <details className="metadata-details">
               <summary>전체 메타데이터</summary>
@@ -354,11 +368,11 @@ function App() {
       {/* 헤더 */}
       <header className="header">
         <div className="header-left">
-          <h1>🤖 SOP 챗봇</h1>
-          <span className="version">v6.2</span>
+          <h1>🤖 SOP 챗봇 <small>v11.0</small></h1>
+          {agentMode && <span className="agent-badge">Agent</span>}
         </div>
         <div className="header-right">
-          <button 
+          <button
             className="settings-btn"
             onClick={() => setShowSettings(!showSettings)}
           >
@@ -382,7 +396,7 @@ function App() {
               className="file-input"
             />
             {uploadStatus && <p className="upload-status">{uploadStatus}</p>}
-            
+
             {/* 🔥 마크다운 미리보기 */}
             <div className="preview-section">
               <h4>🔍 마크다운 미리보기</h4>
@@ -408,7 +422,7 @@ function App() {
                       <span className="doc-name">{doc.doc_name}</span>
                       <span className="doc-chunks">{doc.chunk_count}청크</span>
                     </div>
-                    <button 
+                    <button
                       className="delete-btn"
                       onClick={() => handleDeleteDocument(doc.doc_name)}
                     >
@@ -423,10 +437,10 @@ function App() {
           {/* 설정 */}
           <section className="sidebar-section">
             <h3>⚙️ 설정</h3>
-            
+
             <div className="setting-group">
               <label>임베딩 모델</label>
-              <select 
+              <select
                 value={embeddingModel}
                 onChange={(e) => setEmbeddingModel(e.target.value)}
               >
@@ -439,20 +453,25 @@ function App() {
 
             <div className="setting-group">
               <label>LLM 모델</label>
-              <select 
+              <select
                 value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
+                onChange={(e) => {
+                  setLlmModel(e.target.value);
+                  // 모델에 따라 백엔드 자동 설정
+                  if (e.target.value.includes('glm')) setLlmBackend('zai');
+                  else if (e.target.value.includes(':')) setLlmBackend('ollama');
+                  else setLlmBackend('hf');
+                }}
               >
-                <option value="qwen2.5:0.5b">Qwen2.5-0.5B (초경량)</option>
-                <option value="qwen2.5:1.5b">Qwen2.5-1.5B (경량)</option>
-                <option value="qwen2.5:3b">Qwen2.5-3B (추천)</option>
-                <option value="qwen3:4b">Qwen3-4B (최신)</option>
+                <option value="glm-4.7-flash">GLM-4.7-Flash (Z.AI)</option>
+                <option value="qwen2.5:3b">Qwen2.5-3B (Ollama)</option>
+                <option value="qwen3:4b">Qwen3-4B (Ollama)</option>
               </select>
             </div>
 
             <div className="setting-group">
               <label>청킹 방식</label>
-              <select 
+              <select
                 value={chunkMethod}
                 onChange={(e) => setChunkMethod(e.target.value)}
               >
@@ -465,7 +484,7 @@ function App() {
 
             <div className="setting-group">
               <label>참고 문서 수</label>
-              <select 
+              <select
                 value={nResults}
                 onChange={(e) => setNResults(Number(e.target.value))}
               >
@@ -486,6 +505,28 @@ function App() {
                 />
                 출처 표시
               </label>
+            </div>
+
+            {/* 🤖 에이전트 모드 토글 */}
+            <div className="setting-group agent-toggle">
+              <label className="toggle-label">
+                <span className="toggle-text">
+                  {agentMode ? '🤖 에이전트 모드' : '📄 일반 RAG'}
+                </span>
+                <div className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={agentMode}
+                    onChange={(e) => setAgentMode(e.target.checked)}
+                  />
+                  <span className="toggle-slider"></span>
+                </div>
+              </label>
+              <p className="toggle-description">
+                {agentMode
+                  ? 'LLM이 상황에 맞는 도구를 선택합니다 (LangSmith 추적)'
+                  : '벡터 검색 → LLM 답변 (기본 방식)'}
+              </p>
             </div>
           </section>
         </aside>
@@ -513,19 +554,19 @@ function App() {
                   </div>
                   <div className="message-content">
                     <div className="message-text">{msg.content}</div>
-                    
+
                     {/* 출처 표시 */}
                     {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && showSources && (
                       <div className="sources">
                         <div className="sources-header">
                           📚 참고 문서 ({msg.sources.length})
                         </div>
-                        {msg.sources.map((source, idx) => 
+                        {msg.sources.map((source, idx) =>
                           renderSource(source, idx, msgIndex)
                         )}
                       </div>
                     )}
-                    
+
                     <div className="message-time">
                       {msg.timestamp.toLocaleTimeString()}
                     </div>
@@ -533,7 +574,7 @@ function App() {
                 </div>
               ))
             )}
-            
+
             {isLoading && (
               <div className="message assistant loading">
                 <div className="message-avatar">🤖</div>
@@ -546,7 +587,7 @@ function App() {
                 </div>
               </div>
             )}
-            
+
             <div ref={chatEndRef} />
           </div>
 
@@ -557,7 +598,7 @@ function App() {
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
                 onKeyPress={handleKeyPress}
-                placeholder={documents.length > 0 
+                placeholder={documents.length > 0
                   ? "질문을 입력하세요... (Enter로 전송)"
                   : "먼저 문서를 업로드해주세요"}
                 disabled={isLoading || documents.length === 0}
@@ -571,7 +612,7 @@ function App() {
                 {isLoading ? '⏳' : '📤'}
               </button>
             </div>
-            
+
             <div className="input-actions">
               <button className="clear-btn" onClick={clearChat}>
                 🗑️ 대화 초기화
@@ -600,7 +641,7 @@ function App() {
               )}
             </div>
             <div className="modal-footer">
-              <button 
+              <button
                 className="download-btn"
                 onClick={() => {
                   const blob = new Blob([previewMarkdown], { type: 'text/markdown' })

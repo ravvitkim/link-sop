@@ -1,39 +1,39 @@
-# RAG Chatbot v9.0 Dependencies
+# GMP/SOP RAG + Agent 시스템 의존성
+# pip install -r requirements.txt
 
-# FastAPI 서버
+# === 기본 웹 프레임워크 ===
 fastapi
 uvicorn
 python-multipart
 
-# 문서 파싱
-python-docx
-beautifulsoup4
-
-# PDF 파싱
-PyMuPDF
-PyPDF2
-docling
-
-# 🔥 OCR (이미지 기반 PDF용)
-pytesseract
-pdf2image
-Pillow
-
-# 벡터 스토어
+# === 데이터베이스 ===
 chromadb
-
-# 그래프 DB
+psycopg2-binary
 neo4j
 
-# 🔥 LangGraph 파이프라인
-langgraph
-
-# ML/임베딩
+# === ML/임베딩 ===
 # torch
 transformers
+sentence-transformers
+
+# === PDF 처리 ===
+pdfplumber
+pymupdf
+python-docx
+
+# === LangChain + LangGraph ===
+langchain
+langchain-core
+langchain-community
+langgraph
+
+# === Z.AI (GLM-4.7-Flash) ===
+zai-sdk
+
+# === LangSmith (추적/모니터링) ===
+langsmith
+
+# === 기타 ===
+pydantic
 numpy
-
-# 기타
-requests
-
-# pip install psycopg2-binary
+python-dotenv

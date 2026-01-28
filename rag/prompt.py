@@ -11,7 +11,8 @@ RAG 프롬프트 템플릿 v8.0
 def build_rag_prompt(query: str, context: str, language: str = "ko") -> str:
     """RAG 프롬프트 생성"""
     if language == "ko":
-        return f"""당신은 GMP/QMS 규정(SOP) 전문가입니다. 아래 [참고 문서]를 바탕으로 사용자의 질문에 답변하세요.
+        return f"""당신은 GMP/QMS 규정(SOP) 전문가입니다. **모든 사고 과정(Thinking)과 최종 답변은 반드시 한국어로 작성하세요.**
+아래 [참고 문서]를 바탕으로 사용자의 질문에 답변하세요.
 
 📋 지침:
 1. 반드시 제공된 문서 내용만 사용하세요. 외부 지식이나 추측은 금지입니다.

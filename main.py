@@ -1,13 +1,16 @@
 """
-RAG 챗봇 API v9.2
+RAG 챗봇 API v11.0 + Agent (Z.AI)
 
-🔥 v9.2 변경사항:
-- LangGraph 파이프라인 적용 (document_pipeline.py)
-- 삭제 시 ChromaDB + Neo4j 동시 삭제
-- Question 추적 기능 (RAG 답변 시 참조 섹션 기록)
-- 페이지 번호, Parent-Child 계층 메타데이터
-- 파일명 우선 SOP ID 추출
+🔥 v11.0 변경사항:
+- LLM 백엔드 변경: Ollama → Z.AI GLM-4.7-Flash
+- 에이전트 도구 성능 강화
+- LangSmith 추적 지원 및 최적화
+- 되묻기 로직 제거 및 검색 결과 직접 출력
 """
+
+# 🔥 .env 파일 자동 로드 (다른 import보다 먼저!)
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,10 +36,9 @@ from rag import vector_store
 from rag.prompt import build_rag_prompt, build_chunk_prompt
 from rag.llm import (
     get_llm_response,
+    ZaiLLM,
     OllamaLLM,
     analyze_search_results,
-    generate_clarification_question,
-    OLLAMA_MODELS,
     HUGGINGFACE_MODELS,
 )
 
@@ -68,8 +70,8 @@ app.add_middleware(
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_OVERLAP = 50
 DEFAULT_CHUNK_METHOD = "article"
-DEFAULT_N_RESULTS = 5
-DEFAULT_SIMILARITY_THRESHOLD = 0.35
+DEFAULT_N_RESULTS = 7  # 🔥 5 -> 7 상향
+DEFAULT_SIMILARITY_THRESHOLD = 0.30  # 🔥 0.35 -> 0.30 (더 많은 맥락 확보)
 USE_LANGGRAPH = True  # 🔥 LangGraph 파이프라인 사용 여부
 
 PRESET_MODELS = {
@@ -134,12 +136,14 @@ class AskRequest(BaseModel):
     collection: str = "documents"
     n_results: int = DEFAULT_N_RESULTS
     embedding_model: str = "multilingual-e5-small"
-    llm_model: str = "qwen2.5:3b"
-    llm_backend: str = "ollama"
+    llm_model: str = "glm-4.7-flash"
+    llm_backend: str = "zai"  # 🔥 기본값 zai로 변경
+    temperature: float = 0.7
     filter_doc: Optional[str] = None
     language: str = "ko"
     max_tokens: int = 512
     similarity_threshold: Optional[float] = None
+    include_sources: bool = True
 
 
 class LLMRequest(BaseModel):
@@ -581,7 +585,7 @@ def search_advanced(request: SearchRequest):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """대화형 RAG 챗봇 (v9.3 - 되묻기/추적 제거, 소스 형식 수정)"""
+    """대화형 RAG 챗봇 (v10.1 - 되묻기/추적 제거, 소스 형식 수정)"""
     session_id = request.session_id or str(uuid.uuid4())
     
     if session_id not in chat_histories:
@@ -600,6 +604,21 @@ def chat(request: ChatRequest):
         similarity_threshold=threshold,
     )
     
+    # 🔥 [조정] 컨텍스트가 극단적으로 짧을 때만(예: 400자 미만) 최소한의 보충 수행
+    if len(context) < 400 and len(results) < 10:
+        print(f"⚠️ 컨텍스트가 너무 짧음({len(context)}자). 최소 보충 시도...")
+        extra_results, extra_context = vector_store.search_with_context(
+            query=request.message,
+            collection_name=request.collection,
+            model_name=model_path,
+            n_results=10,  # 15에서 10으로 하향
+            filter_doc=request.filter_doc,
+            similarity_threshold=threshold * 0.7, # 임계값 더 완화하여 주변 맥락 확보
+        )
+        if len(extra_context) > len(context):
+            results, context = extra_results, extra_context
+            print(f"✅ 컨텍스트 보충 완료 ({len(context)}자, {len(results)}개)")
+    
     # 🔥 디버그 로그
     print(f"\n{'='*50}")
     print(f"🔍 질문: {request.message}")
@@ -609,29 +628,34 @@ def chat(request: ChatRequest):
             sim = r.get('similarity', 0)
             meta = r.get('metadata', {})
             sop = meta.get('sop_id', '?')
-            path = meta.get('section_path', '')[:40]
+            path = meta.get('section_path', '')[:40] if meta.get('section_path') else ''
             print(f"   [{i+1}] 유사도: {sim:.2f} | {sop} | {path}...")
     print(f"📝 컨텍스트 길이: {len(context)} 글자")
     
-    # 2. LLM 답변 생성
+    # 2. LLM 답변 생성 (되묻기 로직 제거!)
     prompt = build_rag_prompt(request.message, context)
-    print(f"🤖 LLM 호출: {request.llm_model}")
+    print(f"🤖 LLM 호출 시도:")
+    print(f"   - Backend: {request.llm_backend}")
+    print(f"   - Model: {request.llm_model}")
+    print(f"   - Prompt Prefix: {prompt[:100]}...")
     
     answer = get_llm_response(
         prompt=prompt,
         llm_model=request.llm_model,
         llm_backend=request.llm_backend,
-        max_tokens=512
+        max_tokens=2048 # 🔥 Z.AI 분석과 한국어 답변을 위해 2048 권장
     )
     
-    print(f"💬 답변 길이: {len(answer)} 글자")
+    print(f"💬 LLM 결과:")
+    print(f"   - 답변: {answer[:50]}..." if answer else "   - 답변: (EMPTY)")
+    print(f"   - 길이: {len(answer)} 글자")
     print(f"{'='*50}\n")
     
-    # 히스토리 저장
+    # 3. 히스토리 저장
     chat_histories[session_id].append({"role": "user", "content": request.message})
     chat_histories[session_id].append({"role": "assistant", "content": answer})
     
-    # 🔥 소스 정보 (프론트엔드 형식에 맞춤)
+    # 4. 소스 정보 (프론트엔드 형식에 맞춤!)
     sources = []
     for r in results:
         meta = r.get("metadata", {})
@@ -712,18 +736,20 @@ def ask_with_rag(request: AskRequest):
     except Exception as e:
         print(f"⚠️ Question 추적 실패: {e}")
     
-    sources = [
-        {
-            "doc_name": r.get("metadata", {}).get("doc_name"),
-            "sop_id": r.get("metadata", {}).get("sop_id"),
-            "section": r.get("metadata", {}).get("section"),
-            "section_path": r.get("metadata", {}).get("section_path"),
-            "page": r.get("metadata", {}).get("page"),
-            "similarity": r.get("similarity"),
-            "confidence": r.get("confidence"),
-        }
-        for r in results
-    ]
+    sources = []
+    if request.include_sources:
+        sources = [
+            {
+                "doc_name": r.get("metadata", {}).get("doc_name"),
+                "sop_id": r.get("metadata", {}).get("sop_id"),
+                "section": r.get("metadata", {}).get("section"),
+                "section_path": r.get("metadata", {}).get("section_path"),
+                "page": r.get("metadata", {}).get("page"),
+                "similarity": r.get("similarity"),
+                "confidence": r.get("confidence"),
+            }
+            for r in results
+        ]
     
     return {
         "query": request.query,
@@ -1060,40 +1086,167 @@ def graph_section_usage_stats(sop_id: str = None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 🤖 API 엔드포인트 - 에이전트 (NEW!)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 에이전트 모듈 임포트
+try:
+    from rag.agent import (
+        init_agent_tools, 
+        run_agent, 
+        run_simple_agent,
+        create_agent,
+        AGENT_TOOLS,
+        LANGCHAIN_AVAILABLE,
+        LANGGRAPH_AGENT_AVAILABLE,
+        ZAI_AVAILABLE
+    )
+    AGENT_AVAILABLE = True
+    print("✅ 에이전트 모듈 로드 완료")
+except ImportError as e:
+    AGENT_AVAILABLE = False
+    LANGCHAIN_AVAILABLE = False
+    LANGGRAPH_AGENT_AVAILABLE = False
+    ZAI_AVAILABLE = False
+    print(f"⚠️ 에이전트 모듈 로드 실패: {e}")
+
+
+class AgentRequest(BaseModel):
+    """에이전트 요청"""
+    message: str
+    session_id: Optional[str] = None
+    llm_model: str = "glm-4.7-flash"
+    n_results: int = DEFAULT_N_RESULTS # 🔥 추가
+    use_langgraph: bool = True  # LangGraph 에이전트 사용 여부
+
+
+@app.post("/agent/chat")
+def agent_chat(request: AgentRequest):
+    """
+    🤖 에이전트 채팅 - LLM이 도구를 선택해서 실행
+    
+    일반 RAG와 다르게 에이전트가 상황에 맞는 도구를 선택합니다:
+    - search_sop_documents: 문서 내용 검색
+    - get_document_references: 문서 간 참조 관계
+    - search_sections_by_keyword: 키워드로 섹션 검색
+    - get_document_structure: 문서 구조/목차
+    - list_all_documents: 전체 문서 목록
+    """
+    if not AGENT_AVAILABLE:
+        raise HTTPException(500, "에이전트 모듈이 로드되지 않았습니다")
+    
+    session_id = request.session_id or str(uuid.uuid4())
+    
+    print(f"\n{'='*50}")
+    print(f"🤖 에이전트 질문: {request.message}")
+    print(f"   세션: {session_id}")
+    print(f"   모드: {'LangGraph' if request.use_langgraph else 'Simple'}")
+    
+    try:
+        # 도구 초기화 (처음 한 번만)
+        init_agent_tools(vector_store, get_graph_store())
+        
+        if request.use_langgraph and LANGGRAPH_AGENT_AVAILABLE:
+            # LangGraph 에이전트
+            result = run_agent(
+                query=request.message,
+                session_id=session_id,
+                model_name=request.llm_model
+            )
+        else:
+            # 간단한 규칙 기반 에이전트
+            result = run_simple_agent(
+                query=request.message,
+                vector_store_module=vector_store,
+                graph_store_instance=get_graph_store(),
+                llm_model=request.llm_model
+            )
+        
+        reasoning = result.get("reasoning")
+        answer = result.get("answer", "")
+
+        # 본문(answer)이 비어있는데 reasoning만 있는 경우 (토큰 한도 초과 등으로 답변 생성 실패 시)
+        if not answer and reasoning:
+            print("⚠️ 본문이 비어있어 생각(Reasoning) 추출됨 (답변으로 노출하지 않음)")
+            # 영어 분석 내용이 나오는 것을 방지하기 위해 reasoning 추출은 하되 답변은 에러 메시지로 반환
+            result["answer"] = "❌ 답변 생성 중 토큰 한도에 도달하여 정답을 출력하지 못했습니다. 질문을 더 구체적으로 하거나 토큰 설정을 높여주세요."
+        
+        if reasoning:
+            print(f"🧠 모델의 생각(Reasoning) 추출됨 ({len(reasoning)}자)")
+            # 디버깅을 위해 첫 100자 정도 출력
+            print(f"   [THINK] {reasoning[:150].replace('\n', ' ')}...")
+        
+        print(f"   도구 호출: {len(result.get('tool_calls', []))}회")
+        print(f"   답변 길이: {len(result.get('answer', ''))} 글자")
+        print(f"{'='*50}\n")
+        
+        return {
+            "session_id": session_id,
+            "answer": result.get("answer", ""),
+            "tool_calls": result.get("tool_calls", []),
+            "success": result.get("success", False),
+            "mode": "langgraph" if (request.use_langgraph and LANGGRAPH_AGENT_AVAILABLE) else "simple"
+        }
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"에이전트 실행 실패: {str(e)}")
+
+
+@app.get("/agent/status")
+def agent_status():
+    """에이전트 상태 확인"""
+    return {
+        "agent_available": AGENT_AVAILABLE,
+        "langchain_available": LANGCHAIN_AVAILABLE if AGENT_AVAILABLE else False,
+        "langgraph_agent_available": LANGGRAPH_AGENT_AVAILABLE if AGENT_AVAILABLE else False,
+        "tools": [t.name for t in AGENT_TOOLS] if AGENT_AVAILABLE else [],
+        "message": "에이전트 사용 가능" if AGENT_AVAILABLE else "에이전트 모듈 로드 실패"
+    }
+
+
+@app.get("/agent/tools")
+def agent_tools():
+    """에이전트 도구 목록"""
+    if not AGENT_AVAILABLE:
+        raise HTTPException(500, "에이전트 모듈이 로드되지 않았습니다")
+    
+    tools_info = []
+    for tool in AGENT_TOOLS:
+        tools_info.append({
+            "name": tool.name,
+            "description": tool.description
+        })
+    
+    return {"tools": tools_info, "count": len(tools_info)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 서버 실행
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    init_db()   # ← 이거 추가
+    init_db()
     print("🚀 RAG 시스템 시작")
     
     import uvicorn
     
     print("\n" + "=" * 60)
-    print("🤖 RAG Chatbot API v9.2")
+    print("🤖 RAG Chatbot API v11.0 + Z.AI Agent")
     print("=" * 60)
-    print(f"🔥 LangGraph 파이프라인: {'✅ 활성화' if LANGGRAPH_AVAILABLE else '❌ 비활성화'}")
+    print(f"🔥 LLM 백엔드: {'✅ Z.AI (GLM-4.7-Flash)' if ZaiLLM.is_available() else '❌ ZAI_API_KEY 설정 필요'}")
+    print(f"🤖 에이전트: {'✅ 활성화' if AGENT_AVAILABLE else '❌ 비활성화'}")
     
-    if torch.cuda.is_available():
-        print(f"✅ CUDA: {torch.cuda.get_device_name(0)}")
-    else:
-        print("⚠️ CUDA 불가 - CPU 모드")
-    
-    if OllamaLLM.is_available():
-        models = OllamaLLM.list_models()
-        print(f"✅ Ollama: {len(models)}개 모델")
-    else:
-        print("⚠️ Ollama 미실행")
-    
-    print("=" * 60)
-    print("URL: http://localhost:8000")
+    if AGENT_AVAILABLE:
+        print(f"   - LangChain: {'✅' if LANGCHAIN_AVAILABLE else '❌'}")
     print("Docs: http://localhost:8000/docs")
     print("=" * 60)
     print("주요 기능:")
-    print("  - LangGraph 문서 파이프라인 (v9.2)")
-    print("  - 페이지 번호 / Parent-Child 계층")
-    print("  - Question 추적 (Neo4j)")
-    print("  - ChromaDB + Neo4j 동기화 삭제")
+    print("  - LangGraph 문서 파이프라인")
+    print("  - 🤖 ReAct 에이전트 (/agent/chat)")
+    print("  - ChromaDB + Neo4j + PostgreSQL")
+    print("  - LangSmith 추적 지원")
     print("=" * 60)
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
