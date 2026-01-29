@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 import re
 from io import BytesIO
 import operator
+import json
+from .llm import get_llm_response
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -79,32 +81,18 @@ class Chunk:
 
 def extract_document_metadata(text: str, filename: str) -> Dict:
     """
-    문서 헤더에서 메타데이터 추출
-    
-    🔥 v9.2: 파일명에서 SOP ID 우선 추출
-    
-    Returns:
-        {
-            "sop_id": "EQ-SOP-00010",
-            "version": "1.0",
-            "effective_date": "2025-01-21",
-            "title": "품질관리기준서",
-            "department": "품질경영실",
-            "file_name": "xxx.pdf"
-        }
+    문서 헤더에서 메타데이터 추출 (Hybrid: Regex + LLM)
     """
     metadata = {"file_name": filename}
     
-    # 🔥 SOP ID - 파일명 우선!
-    # 1순위: 파일명에서 추출
+    # 1단계: 정규표현식 추출 (Regex)
+    # SOP ID
     filename_sop = re.search(r'(EQ-SOP-\d+)', filename, re.IGNORECASE)
     if filename_sop:
         metadata["sop_id"] = filename_sop.group(1).upper()
     else:
-        # 2순위: 문서 헤더 "Number:" 필드
         sop_match = re.search(r'Number:\s*(EQ-SOP-\d+)', text)
         if not sop_match:
-            # 3순위: 문서 내용에서 첫 번째 발견
             sop_match = re.search(r'(EQ-SOP-\d+)', text)
         if sop_match:
             metadata["sop_id"] = sop_match.group(1).upper()
@@ -121,16 +109,45 @@ def extract_document_metadata(text: str, filename: str) -> Dict:
     if date_match:
         metadata["effective_date"] = date_match.group(1)
     
-    # Title (한글 제목 우선)
-    title_match = re.search(r'Title\s+([가-힣]+)', text)
+    # Title (더 유연하게 수정: Title 뒤의 한 줄 전체)
+    title_match = re.search(r'Title[:\s]+(.+)', text)
     if title_match:
-        metadata["title"] = title_match.group(1)
+        metadata["title"] = title_match.group(1).strip()
     
-    # Department
-    dept_match = re.search(r'Owning Department\s+([가-힣]+)', text)
-    if dept_match:
-        metadata["department"] = dept_match.group(1)
-    
+    # 2단계: 필수 정보 누락 시 LLM 폴백 (LLM)
+    if not metadata.get("sop_id") or not metadata.get("title"):
+        print(f"🧠 [Metadata] 필수 정보 누락으로 LLM 추출 시도 중... (File: {filename})")
+        
+        # 문서 전반부 2000자만 추출용으로 사용
+        head_text = text[:2000]
+        prompt = f"""다음 문서를 분석하여 [SOP ID, 버전, 시행일, 제목, 담당부서]를 추출하세요.
+형식에 구애받지 말고 가장 적절한 값을 찾으세요. 결과는 반드시 다음과 같은 JSON 형식으로만 답변하세요.
+
+{{
+  "sop_id": "ID패턴(예: EQ-SOP-0001)이 없으면 null",
+  "version": "버전 없으면 null",
+  "effective_date": "YYYY-MM-DD 형식, 없으면 null",
+  "title": "문서 제목",
+  "department": "담당 부서명"
+}}
+
+[문서 내용]
+{head_text}"""
+        
+        try:
+            llm_res = get_llm_response(prompt, max_tokens=300, temperature=0.1)
+            # JSON만 추출 (```json ... ``` 또는 직접 { ... })
+            json_match = re.search(r'\{.*\}', llm_res, re.DOTALL)
+            if json_match:
+                llm_meta = json.loads(json_match.group(0))
+                # 기존 Regex 결과가 없는 경우에만 덮어쓰기
+                for k, v in llm_meta.items():
+                    if v and not metadata.get(k):
+                        metadata[k] = v
+                print(f"✅ [Metadata] LLM 추출 성공: {metadata.get('sop_id')}")
+        except Exception as e:
+            print(f"⚠️ [Metadata] LLM 추출 실패: {e}")
+
     return metadata
 
 

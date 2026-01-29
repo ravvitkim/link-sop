@@ -21,7 +21,9 @@ import torch
 import time
 import uuid
 
-from db import init_db, save_chunks_to_db
+from rag.sql_store import SQLStore
+sql_store = SQLStore()
+sql_store.init_db()
 
 # RAG 모듈 - 레거시 (폴백용)
 from rag import (
@@ -312,7 +314,11 @@ async def upload_document(
             # 메타데이터 보강
             metadata_base = result.get("metadata", {})
             sop_id = metadata_base.get("sop_id")
-            doc_title = metadata_base.get("title", filename)
+            # 제목 설정: 원본 파일명 유지 (사용자 요청)
+            doc_title = filename 
+            extracted_title = metadata_base.get("title")
+            if extracted_title and extracted_title not in filename:
+                doc_title = f"{filename} ({extracted_title})"
             
             print(f"   SOP ID: {sop_id}")
             print(f"   제목: {doc_title}")
@@ -398,7 +404,30 @@ async def upload_document(
         print(f"   ✅ ChromaDB 저장 완료: {len(chunks)} 청크")
         
         # === PostgreSQL 저장 ===
-        save_chunks_to_db(sop_id, filename, chunks)
+        try:
+            # 원본 마크다운 결정 (LangGraph 결과 우선, 없으면 청크 합산)
+            full_markdown = ""
+            if use_langgraph and 'result' in locals() and result.get("markdown"):
+                full_markdown = result.get("markdown")
+            else:
+                full_markdown = "\n\n".join([c.text for c in chunks])
+
+            sql_store.save_document(
+                sop_id=sop_id,
+                title=doc_title or filename,
+                markdown_content=full_markdown,
+                pdf_binary=content if filename.lower().endswith(".pdf") else None,
+                doc_metadata={
+                    "version": metadata_base.get("version"),
+                    "effective_date": metadata_base.get("effective_date"),
+                    "department": metadata_base.get("department"),
+                    "filename": filename
+                }
+            )
+        except Exception as sql_err:
+            print(f"   ⚠️ PostgreSQL 상세 저장 실패: {sql_err}")
+            # 폴백: 기존 유저 코드 방식 (필요 시)
+            # save_chunks_to_db(sop_id, filename, chunks)
         
         # === Neo4j 그래프 저장 ===
         graph_uploaded = False
@@ -1115,6 +1144,7 @@ class AgentRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     llm_model: str = "glm-4.7-flash"
+    embedding_model: str = "multilingual-e5-small" # 추가
     n_results: int = DEFAULT_N_RESULTS # 🔥 추가
     use_langgraph: bool = True  # LangGraph 에이전트 사용 여부
 
@@ -1143,13 +1173,14 @@ def agent_chat(request: AgentRequest):
     
     try:
         # 도구 초기화 (처음 한 번만)
-        init_agent_tools(vector_store, get_graph_store())
+        init_agent_tools(vector_store, get_graph_store(), sql_store)
         
         # 통합된 멀티 에이전트 워크플로우 실행
         result = run_agent(
             query=request.message,
             session_id=session_id,
-            model_name=request.llm_model
+            model_name=request.llm_model,
+            embedding_model=resolve_model_path(request.embedding_model)
         )
         
         reasoning = result.get("reasoning")
@@ -1157,9 +1188,9 @@ def agent_chat(request: AgentRequest):
 
         # 본문(answer)이 비어있는데 reasoning만 있는 경우 (토큰 한도 초과 등으로 답변 생성 실패 시)
         if not answer and reasoning:
-            print("⚠️ 본문이 비어있어 생각(Reasoning) 추출됨 (답변으로 노출하지 않음)")
-            # 영어 분석 내용이 나오는 것을 방지하기 위해 reasoning 추출은 하되 답변은 에러 메시지로 반환
-            result["answer"] = "❌ 답변 생성 중 토큰 한도에 도달하여 정답을 출력하지 못했습니다. 질문을 더 구체적으로 하거나 토큰 설정을 높여주세요."
+            print("⚠️ 본문이 직접적으로 수신되지 않아 사고 과정(Reasoning)을 답변으로 최우선 노출합니다.")
+            result["answer"] = f"[AI 분석 리포트]\n\n{reasoning}"
+            answer = result["answer"]
         
         if reasoning:
             print(f"🧠 모델의 생각(Reasoning) 추출됨 ({len(reasoning)}자)")
@@ -1217,7 +1248,7 @@ def agent_tools():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    init_db()
+    sql_store.init_db()
     print("🚀 RAG 시스템 시작")
     
     import uvicorn
