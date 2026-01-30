@@ -310,6 +310,20 @@ def reasoner_node(state: AgentState):
                     "required": ["query"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_document_references",
+                "description": "특정 SOP 문서가 참조하고 있는 다른 연관 문서 목록을 조회합니다 (Graph DB 기반).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sop_id": {"type": "string", "description": "조회할 SOP ID (예: EQ-SOP-00010)"}
+                    },
+                    "required": ["sop_id"]
+                }
+            }
         }
     ]
 
@@ -350,22 +364,60 @@ def tool_node(state: AgentState):
             
             print(f"🛠️ [Tool] {tool_name} 실행 중... ({args})")
             
+            obs = ""
             if tool_name == "hybrid_search_sop":
-                # keywords가 없으면 state에 저장된 것을 폴백으로 사용
                 kw = args.get("keywords") or state.get("keywords", [])
                 obs = hybrid_search_sop.invoke({
                     "query": args["query"], 
                     "keywords": kw,
                     "embedding_model": state.get("embedding_model")
                 })
-                new_messages.append({
-                    "role": "tool", 
-                    "tool_call_id": tc.id, 
-                    "name": tool_name, 
-                    "content": obs
+            elif tool_name == "get_document_references":
+                obs = get_document_references.invoke({
+                    "sop_id": args["sop_id"]
                 })
+            
+            new_messages.append({
+                "role": "tool", 
+                "tool_call_id": tc.id, 
+                "name": tool_name, 
+                "content": obs or "❌ 검색 결과가 없습니다."
+            })
     
     return {"messages": new_messages}
+
+def verifier_node(state: AgentState):
+    """최종 규정 검증 및 무결성 체크 노드"""
+    print(f"⚖️ [Verifier] 최종 규정 적합성 판단 및 검증 중")
+    
+    # 그동안 수집된 모든 메시지를 바탕으로 최종 검증 수행
+    # 시스템 프롬프트를 검증 모드로 다시 강조
+    verification_prompt = """당신은 품질보증(QA) 부서의 최종 승인권자입니다. 
+에이전트가 앞서 수집한 규정 데이터들을 바탕으로 다음 사항을 최종 점검하세요:
+1. **상충 여부**: 수집된 여러 SOP 간에 서로 모순되는 지침이 있는지 확인하세요.
+2. **누락 여부**: 질문에 핵심적인 답변을 제공하기에 근거 데이터가 충분한지 판단하세요.
+3. **규정 준수**: 답변이 GMP 규정의 취지를 훼손하지 않는지 검토하세요.
+
+만약 데이터가 부족하거나 상충된다면 그 사실을 명시하고, 가능한 범위 내에서 최선의 권고안을 제시하세요."""
+
+    messages = [{"role": "system", "content": verification_prompt}] + state["messages"]
+    
+    try:
+        # 검증 결과 생성 (LLM 호출)
+        res = _llm_chat_completion(
+            model=state["model_name"], 
+            messages=messages,
+            tool_choice="none" # 최종 답변 생성 시에는 도구 사용 안 함
+        )
+        msg = res.choices[0].message
+        return {
+            "answer": msg.content or "",
+            "reasoning": getattr(msg, 'reasoning_content', ""),
+            "messages": [msg]
+        }
+    except Exception as e:
+        print(f"⚠️ [Verifier Error] {e}")
+        return {}
 
 def should_continue(state: AgentState):
     """루프 종료 여부 결정"""
@@ -388,21 +440,23 @@ def create_workflow():
     workflow.add_node("expansion", query_expansion_node)
     workflow.add_node("reasoner", reasoner_node)
     workflow.add_node("tools", tool_node)
+    workflow.add_node("verifier", verifier_node) # 검증 노드 추가
     
     # 엣지 연결
     workflow.add_edge(START, "expansion")
     workflow.add_edge("expansion", "reasoner")
     
-    # 🔥 ReAct 루프: Reasoner -> (Tools -> Reasoner) -> End
+    # 🔥 ReAct 루프: Reasoner -> (Tools -> Reasoner) -> Verifier -> End
     workflow.add_conditional_edges(
         "reasoner",
         should_continue,
         {
             "tools": "tools",
-            END: END
+            END: "verifier" # 루프 종료 시 바로 END로 가지 않고 검증 단계를 거침
         }
     )
     workflow.add_edge("tools", "reasoner")
+    workflow.add_edge("verifier", END)
     
     return workflow.compile()
 
