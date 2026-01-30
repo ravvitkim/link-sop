@@ -54,7 +54,7 @@ def init_agent_tools(vector_store_module, graph_store_instance, sql_store_instan
     _sql_store = sql_store_instance
 
 @tool
-def hybrid_search_sop(query: str, embedding_model: str = "jhgan/ko-sroberta-multitask") -> str:
+def hybrid_search_sop(query: str, embedding_model: str = "intfloat/multilingual-e5-small") -> str:
     """SOP 문서 검색 (Vector + SQL 하이브리드)"""
     if not _vector_store: return "❌ 벡터 스토어 미설정"
     
@@ -229,7 +229,7 @@ def verifier_agent_node(state: AgentState):
     except Exception as e:
         return {"answer": f"❌ 오류 발생: {e}", "reasoning": str(e)}
 
-def run_agent(query: str, session_id: str = "default", model_name: str = "glm-4.7-flash", embedding_model: str = "jhgan/ko-sroberta-multitask"):
+def run_agent(query: str, session_id: str = "default", model_name: str = "glm-4.7-flash", embedding_model: str = "intfloat/multilingual-e5-small"):
     if not _agent: create_agent(model_name)
     state = {"query": query, "model_name": model_name, "embedding_model": embedding_model}
     

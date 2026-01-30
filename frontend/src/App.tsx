@@ -445,7 +445,6 @@ function App() {
                 onChange={(e) => setEmbeddingModel(e.target.value)}
               >
                 <option value="multilingual-e5-small">E5-Small (경량)</option>
-                <option value="ko-sroberta">Ko-SROBERTA (한국어)</option>
                 <option value="ko-sbert">Ko-SBERT (한국어)</option>
                 <option value="bge-m3">BGE-M3 (고성능)</option>
               </select>
@@ -482,30 +481,34 @@ function App() {
               </select>
             </div>
 
-            <div className="setting-group">
-              <label>참고 문서 수</label>
-              <select
-                value={nResults}
-                onChange={(e) => setNResults(Number(e.target.value))}
-              >
-                <option value={1}>1개</option>
-                <option value={2}>2개</option>
-                <option value={3}>3개 (기본)</option>
-                <option value={5}>5개</option>
-                <option value={10}>10개</option>
-              </select>
-            </div>
+            {!agentMode && (
+              <div className="setting-group">
+                <label>참고 문서 수</label>
+                <select
+                  value={nResults}
+                  onChange={(e) => setNResults(Number(e.target.value))}
+                >
+                  <option value={1}>1개</option>
+                  <option value={2}>2개</option>
+                  <option value={3}>3개 (기본)</option>
+                  <option value={5}>5개</option>
+                  <option value={10}>10개</option>
+                </select>
+              </div>
+            )}
 
-            <div className="setting-group">
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={showSources}
-                  onChange={(e) => setShowSources(e.target.checked)}
-                />
-                출처 표시
-              </label>
-            </div>
+            {!agentMode && (
+              <div className="setting-group">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={showSources}
+                    onChange={(e) => setShowSources(e.target.checked)}
+                  />
+                  출처 표시
+                </label>
+              </div>
+            )}
 
             {/* 🤖 에이전트 모드 토글 */}
             <div className="setting-group agent-toggle">

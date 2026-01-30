@@ -44,9 +44,6 @@ _device: Optional[str] = None
 # ═══════════════════════════════════════════════════════════════════════════
 
 EMBEDDING_MODEL_SPECS = {
-    "jhgan/ko-sroberta-multitask": {
-        "name": "ko-sroberta", "dim": 768, "memory_mb": 440, "lang": "ko",
-    },
     "snunlp/KR-SBERT-V40K-klueNLI-augSTS": {
         "name": "ko-sbert", "dim": 768, "memory_mb": 440, "lang": "ko",
     },
@@ -197,7 +194,7 @@ def filter_compatible_models() -> List[Dict]:
 # 임베딩 모델
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_embedding_model(model_name: str = "jhgan/ko-sroberta-multitask"):
+def get_embedding_model(model_name: str = "intfloat/multilingual-e5-small"):
     """임베딩 모델 로드"""
     global _embed_models
 
@@ -216,7 +213,7 @@ def get_embedding_model(model_name: str = "jhgan/ko-sroberta-multitask"):
     return tokenizer, model
 
 
-def embed_text(text: str, model_name: str = "jhgan/ko-sroberta-multitask") -> List[float]:
+def embed_text(text: str, model_name: str = "intfloat/multilingual-e5-small") -> List[float]:
     """텍스트 임베딩"""
     tokenizer, model = get_embedding_model(model_name)
     device = get_device()
@@ -279,7 +276,7 @@ def add_documents(
     texts: List[str],
     metadatas: List[Dict],
     collection_name: str = DEFAULT_COLLECTION,
-    model_name: str = "jhgan/ko-sroberta-multitask",
+    model_name: str = "intfloat/multilingual-e5-small",
 ) -> Dict:
     """문서 추가"""
     actual_collection_name = get_collection_name_for_model(collection_name, model_name)
@@ -331,7 +328,7 @@ def add_single_text(
     text: str,
     metadata: Dict,
     collection_name: str = DEFAULT_COLLECTION,
-    model_name: str = "jhgan/ko-sroberta-multitask",
+    model_name: str = "intfloat/multilingual-e5-small",
 ) -> Dict:
     """단일 텍스트 추가"""
     return add_documents([text], [metadata], collection_name, model_name)
@@ -345,7 +342,7 @@ def search(
     query: str,
     collection_name: str = DEFAULT_COLLECTION,
     n_results: int = 5,
-    model_name: str = "jhgan/ko-sroberta-multitask",
+    model_name: str = "intfloat/multilingual-e5-small",
     filter_doc: Optional[str] = None,
     similarity_threshold: Optional[float] = None,
     return_low_confidence: bool = False,
@@ -437,7 +434,7 @@ def search_with_context(
     query: str,
     collection_name: str = DEFAULT_COLLECTION,
     n_results: int = 3,
-    model_name: str = "jhgan/ko-sroberta-multitask",
+    model_name: str = "intfloat/multilingual-e5-small",
     filter_doc: Optional[str] = None,
     similarity_threshold: Optional[float] = None,
 ) -> Tuple[List[Dict], str]:
@@ -492,7 +489,7 @@ def search_advanced(
     query: str,
     collection_name: str = DEFAULT_COLLECTION,
     n_results: int = 5,
-    model_name: str = "jhgan/ko-sroberta-multitask",
+    model_name: str = "intfloat/multilingual-e5-small",
     filter_doc: Optional[str] = None,
     similarity_threshold: Optional[float] = None,
 ) -> SearchResponse:

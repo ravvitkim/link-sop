@@ -77,7 +77,6 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.30  # 🔥 0.35 -> 0.30 (더 많은 맥락 확�
 USE_LANGGRAPH = True  # 🔥 LangGraph 파이프라인 사용 여부
 
 PRESET_MODELS = {
-    "ko-sroberta": "jhgan/ko-sroberta-multitask",
     "ko-sbert": "snunlp/KR-SBERT-V40K-klueNLI-augSTS",
     "ko-simcse": "BM-K/KoSimCSE-roberta",
     "multilingual-minilm": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
