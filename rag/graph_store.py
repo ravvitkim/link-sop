@@ -7,21 +7,20 @@ Neo4j 그래프 저장소 모듈 v9.1
 - RAG 설명 가능성(Explainability) 강화
 
 노드 타입:
-- Document: SOP 문서 (sop_id, title, version)
-- Section: 섹션 (name, type, content)
-- Term: 정의된 용어 (name, definition)
-- Role: 책임 역할 (name, responsibilities)
-- Question: 🆕 사용자 질문 (text, answer, created_at)
+- Document: 문서 고유 번호 (doc_id, title, version, effective_date, owning_dept)
+- Section: 조항/절 (section_id, title, content, clause_level, main_section, embedding, content_type, main_topic, sub_topics, actors, actions, conditions, summary, intent_scope, intent_summary, intent_embedding, language)
+- DocumentType: 문서 유형 (code, name_kr, name_en)
+- Concept: 관리 개념 (concept_id, name_kr, name_en, description)
+- Question: 사용자 질문 기록
 
 관계 타입:
-- HAS_SECTION: Document -> Section
-- PARENT_OF: Section -> Section (계층 구조)
-- DEFINES: Document -> Term
-- ASSIGNS: Document -> Role
-- REFERENCES: Document -> Document (상호 참조)
-- RELATED_TO: Term -> Term
-- USED_SECTION: 🆕 Question -> Section (답변 시 참조한 섹션)
-- ABOUT_DOCUMENT: 🆕 Question -> Document (질문 대상 문서)
+- HAS_SECTION: Document -> Section (문서가 포함하는 조항)
+- PARENT_OF: Section -> Section (조항 간 상/하위 계층)
+- REFERENCES: Document -> Document (문서 간 상호 참조)
+- IS_TYPE: Document -> DocumentType (문서 유형 연결)
+- MENTIONS: Section -> Document (조항 내 타 문서 언급)
+- BELONGS_TO_CONCEPT: Section -> Concept (조항의 관리 영역 연결)
+- USED_SECTION: Question -> Section (답변 시 참조한 섹션)
 """
 
 from neo4j import GraphDatabase
@@ -88,13 +87,17 @@ class Neo4jGraphStore:
     def init_schema(self):
         """인덱스 및 제약조건 생성"""
         constraints = [
-            "CREATE CONSTRAINT doc_sop_id IF NOT EXISTS FOR (d:Document) REQUIRE d.sop_id IS UNIQUE",
+            "CREATE CONSTRAINT doc_id IF NOT EXISTS FOR (d:Document) REQUIRE d.doc_id IS UNIQUE",
+            "CREATE CONSTRAINT section_id IF NOT EXISTS FOR (s:Section) REQUIRE s.section_id IS UNIQUE",
+            "CREATE CONSTRAINT doctype_code IF NOT EXISTS FOR (dt:DocumentType) REQUIRE dt.code IS UNIQUE",
+            "CREATE CONSTRAINT concept_id IF NOT EXISTS FOR (c:Concept) REQUIRE c.concept_id IS UNIQUE",
             "CREATE CONSTRAINT term_name IF NOT EXISTS FOR (t:Term) REQUIRE t.name IS UNIQUE",
-            "CREATE CONSTRAINT question_id IF NOT EXISTS FOR (q:Question) REQUIRE q.id IS UNIQUE",  # 🆕
+            "CREATE CONSTRAINT question_id IF NOT EXISTS FOR (q:Question) REQUIRE q.id IS UNIQUE",
             "CREATE INDEX doc_title IF NOT EXISTS FOR (d:Document) ON (d.title)",
-            "CREATE INDEX section_name IF NOT EXISTS FOR (s:Section) ON (s.name)",
-            "CREATE INDEX section_path IF NOT EXISTS FOR (s:Section) ON (s.section_path)",
-            "CREATE INDEX question_created IF NOT EXISTS FOR (q:Question) ON (q.created_at)",  # 🆕
+            "CREATE INDEX section_title IF NOT EXISTS FOR (s:Section) ON (s.title)",
+            "CREATE INDEX section_main_topic IF NOT EXISTS FOR (s:Section) ON (s.main_topic)",
+            "CREATE INDEX section_intent_scope IF NOT EXISTS FOR (s:Section) ON (s.intent_scope)",
+            "CREATE INDEX question_created IF NOT EXISTS FOR (q:Question) ON (q.created_at)",
         ]
         
         with self.driver.session(database=self.database) as session:
@@ -173,20 +176,20 @@ class Neo4jGraphStore:
     
     def create_document(
         self,
-        sop_id: str,
+        doc_id: str,
         title: str,
         version: str = "1.0",
-        doc_type: str = "SOP",
-        level: int = 2,
+        effective_date: str = None,
+        owning_dept: str = None,
         metadata: Dict = None
     ) -> Dict:
         """Document 노드 생성"""
         query = """
-        MERGE (d:Document {sop_id: $sop_id})
+        MERGE (d:Document {doc_id: $doc_id})
         SET d.title = $title,
             d.version = $version,
-            d.doc_type = $doc_type,
-            d.level = $level,
+            d.effective_date = $effective_date,
+            d.owning_dept = $owning_dept,
             d.metadata = $metadata,
             d.updated_at = datetime()
         RETURN d
@@ -195,11 +198,11 @@ class Neo4jGraphStore:
         with self.driver.session(database=self.database) as session:
             result = session.run(
                 query,
-                sop_id=sop_id,
+                doc_id=doc_id,
                 title=title,
                 version=version,
-                doc_type=doc_type,
-                level=level,
+                effective_date=effective_date,
+                owning_dept=owning_dept,
                 metadata=str(metadata or {})
             )
             record = result.single()
@@ -211,39 +214,64 @@ class Neo4jGraphStore:
     
     def create_section(
         self,
-        sop_id: str,
+        doc_id: str,
         section_id: str,
-        name: str,
-        section_type: str,
-        content: str = "",
-        section_path: str = None,
-        section_path_readable: str = None,
-        page: int = None  # 🆕 페이지 번호
+        title: str,
+        content: str,
+        clause_level: int = 0,
+        main_section: str = None,
+        embedding: List[float] = None,
+        llm_meta: Dict = None,
+        page: int = None
     ) -> Dict:
         """Section 노드 생성 및 Document와 연결"""
         query = """
-        MATCH (d:Document {sop_id: $sop_id})
-        MERGE (s:Section {doc_sop_id: $sop_id, section_id: $section_id})
-        SET s.name = $name,
-            s.section_type = $section_type,
+        MATCH (d:Document {doc_id: $doc_id})
+        MERGE (s:Section {section_id: $section_id})
+        SET s.title = $title,
             s.content = $content,
-            s.section_path = $section_path,
-            s.section_path_readable = $section_path_readable,
-            s.page = $page
+            s.clause_level = $clause_level,
+            s.main_section = $main_section,
+            s.embedding = $embedding,
+            s.content_type = $content_type,
+            s.main_topic = $main_topic,
+            s.sub_topics = $sub_topics,
+            s.actors = $actors,
+            s.actions = $actions,
+            s.conditions = $conditions,
+            s.summary = $summary,
+            s.intent_scope = $intent_scope,
+            s.intent_summary = $intent_summary,
+            s.intent_embedding = $intent_embedding,
+            s.language = $language,
+            s.page = $page,
+            s.doc_id = $doc_id
         MERGE (d)-[:HAS_SECTION]->(s)
         RETURN s
         """
         
+        meta = llm_meta or {}
         with self.driver.session(database=self.database) as session:
             result = session.run(
                 query,
-                sop_id=sop_id,
+                doc_id=doc_id,
                 section_id=section_id,
-                name=name,
-                section_type=section_type,
-                content=content[:5000] if content else "",
-                section_path=section_path,
-                section_path_readable=section_path_readable,
+                title=title,
+                content=content,
+                clause_level=clause_level,
+                main_section=main_section,
+                embedding=embedding,
+                content_type=meta.get("content_type"),
+                main_topic=meta.get("main_topic"),
+                sub_topics=meta.get("sub_topics"), # 쉼표 구분 문자열 기대
+                actors=meta.get("actors"),
+                actions=meta.get("actions"),
+                conditions=meta.get("conditions"),
+                summary=meta.get("summary"),
+                intent_scope=meta.get("intent_scope"),
+                intent_summary=meta.get("intent_summary"),
+                intent_embedding=meta.get("intent_embedding"),
+                language=meta.get("language", "ko"),
                 page=page
             )
             record = result.single()
@@ -251,21 +279,19 @@ class Neo4jGraphStore:
     
     def create_section_hierarchy(
         self,
-        sop_id: str,
         parent_section_id: str,
         child_section_id: str
     ):
         """섹션 간 계층 관계 생성"""
         query = """
-        MATCH (parent:Section {doc_sop_id: $sop_id, section_id: $parent_id})
-        MATCH (child:Section {doc_sop_id: $sop_id, section_id: $child_id})
+        MATCH (parent:Section {section_id: $parent_id})
+        MATCH (child:Section {section_id: $child_id})
         MERGE (parent)-[:PARENT_OF]->(child)
         """
         
         with self.driver.session(database=self.database) as session:
             session.run(
                 query,
-                sop_id=sop_id,
                 parent_id=parent_section_id,
                 child_id=child_section_id
             )
@@ -377,12 +403,12 @@ class Neo4jGraphStore:
     def link_question_to_document(
         self,
         question_id: str,
-        sop_id: str
+        doc_id: str
     ):
         """Question과 관련 Document 연결 (ABOUT_DOCUMENT 관계)"""
         query = """
         MATCH (q:Question {id: $question_id})
-        MATCH (d:Document {sop_id: $sop_id})
+        MATCH (d:Document {doc_id: $doc_id})
         MERGE (q)-[r:ABOUT_DOCUMENT]->(d)
         SET r.linked_at = datetime()
         RETURN r
@@ -392,8 +418,65 @@ class Neo4jGraphStore:
             session.run(
                 query,
                 question_id=question_id,
-                sop_id=sop_id
+                doc_id=doc_id
             )
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 신규 노드 및 관계 기능
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def create_document_type(self, code: str, name_kr: str, name_en: str):
+        """DocumentType 노드 생성"""
+        query = """
+        MERGE (dt:DocumentType {code: $code})
+        SET dt.name_kr = $name_kr,
+            dt.name_en = $name_en
+        RETURN dt
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(query, code=code, name_kr=name_kr, name_en=name_en)
+
+    def link_doc_to_type(self, doc_id: str, type_code: str):
+        """Document -> DocumentType 연결 (IS_TYPE)"""
+        query = """
+        MATCH (d:Document {doc_id: $doc_id})
+        MATCH (dt:DocumentType {code: $type_code})
+        MERGE (d)-[:IS_TYPE]->(dt)
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(query, doc_id=doc_id, type_code=type_code)
+
+    def create_concept(self, concept_id: str, name_kr: str, name_en: str, description: str = None):
+        """Concept 노드 생성"""
+        query = """
+        MERGE (c:Concept {concept_id: $concept_id})
+        SET c.name_kr = $name_kr,
+            c.name_en = $name_en,
+            c.description = $description
+        RETURN c
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(query, concept_id=concept_id, name_kr=name_kr, name_en=name_en, description=description)
+
+    def link_section_to_concept(self, section_id: str, concept_id: str):
+        """Section -> Concept 연결 (BELONGS_TO_CONCEPT)"""
+        query = """
+        MATCH (s:Section {section_id: $section_id})
+        MATCH (c:Concept {concept_id: $concept_id})
+        MERGE (s)-[:BELONGS_TO_CONCEPT]->(c)
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(query, section_id=section_id, concept_id=concept_id)
+
+    def link_section_to_mention_doc(self, section_id: str, mentioned_doc_id: str):
+        """Section -> Document 연결 (MENTIONS)"""
+        query = """
+        MATCH (s:Section {section_id: $section_id})
+        MERGE (d:Document {doc_id: $mentioned_doc_id})
+        MERGE (s)-[:MENTIONS]->(d)
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(query, section_id=section_id, mentioned_doc_id=mentioned_doc_id)
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 🆕 Question 조회 (RAG 설명 가능성)

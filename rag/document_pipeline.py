@@ -30,6 +30,7 @@ import re
 from io import BytesIO
 import operator
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .llm import get_llm_response
 
 
@@ -85,54 +86,112 @@ def extract_document_metadata(text: str, filename: str) -> Dict:
     """
     print(f"🧠 [Metadata] AI 기반 지능형 메타데이터 추출 중... (File: {filename})")
     
-    # 문서 전반부 3000자만 추출용으로 사용 (더 넓은 맥락 확보)
     head_text = text[:3000]
     
     prompt = f"""당신은 GMP 규정(SOP) 분석 전문가입니다. 다음 문서의 내용을 분석하여 관리용 메타데이터를 추출하세요.
 
 [추출 규칙]
-1. SOP ID: 'EQ-SOP-0001'과 같은 관리 번호를 찾으세요. 문서 번호, 관리 번호 등의 항목을 확인하세요.
-2. 제목: 문서의 공식 명칭을 추출하세요.
-3. 버전: '1.0' 또는 'Ver 2.1' 같은 형식을 찾으세요.
-4. 시행일: YYYY-MM-DD 형식으로 변환하여 추출하세요.
-5. 담당 부서: 생산팀, 품질보증팀 등 담당 조직명을 찾으세요.
+1. doc_id: 'EQ-SOP-0001'과 같은 관리 번호를 찾으세요.
+2. title: 문서의 공식 명칭을 정확히 추출하세요. 
+3. version: '1.0' 또는 'Ver 2.1' 같은 형식을 찾으세요.
+4. effective_date: YYYY-MM-DD 형식으로 변환하세요.
+5. owning_dept: 생산팀, 품질보증팀 등 담당 조직명을 찾으세요.
 
-[주의 사항]
-- 확실하지 않은 정보는 지어내지 말고 null로 답변하세요.
-- 결과는 반드시 아래 JSON 형식으로만 답변하세요.
-
+결과는 반드시 아래 JSON 형식으로만 답변하세요.
 {{
-  "sop_id": "추출된 ID (없으면 null)",
+  "doc_id": "추출된 ID (없으면 null)",
+  "title": "문서 제목 (필수)",
   "version": "추출된 버전 (없으면 null)",
   "effective_date": "YYYY-MM-DD (없으면 null)",
-  "title": "문서 제목 (필수)",
-  "department": "담당 부서 (없으면 null)"
+  "owning_dept": "담당 부서 (없으면 null)"
 }}
 
 [파일명]
 {filename}
 
+[주의사항]
+반드시 생각 과정(Reasoning)을 생략하고, 최종 JSON 데이터만 출력하세요.
+
 [문서 내용]
 {head_text}"""
     
     metadata = {"file_name": filename}
-    
     try:
-        llm_res = get_llm_response(prompt, max_tokens=500, temperature=0.1)
-        # JSON만 추출
+        llm_res = get_llm_response(prompt, max_tokens=4096, temperature=0.1)
         json_match = re.search(r'\{.*\}', llm_res, re.DOTALL)
         if json_match:
             llm_meta = json.loads(json_match.group(0))
+            # 🔥 호환성 레이어: doc_id를 sop_id로도 복사
+            if 'doc_id' in llm_meta and 'sop_id' not in llm_meta:
+                llm_meta['sop_id'] = llm_meta['doc_id']
             metadata.update(llm_meta)
-            print(f"✅ [Metadata] AI 추출 성공: {metadata.get('sop_id') or 'ID 미확인'}")
+            print(f"✅ [Metadata] AI 추출 성공: {metadata.get('doc_id') or metadata.get('sop_id') or 'ID 미확인'}")
     except Exception as e:
         print(f"⚠️ [Metadata] AI 추출 실패: {e}")
-        # 실패 시 최소한 파일명에서라도 ID 유추 (이것도 AI에게 맡길 수 있지만 백업용으로 남김)
-        if not metadata.get("sop_id"):
-            id_guess = re.search(r'(EQ-SOP-\d+)', filename, re.IGNORECASE)
-            if id_guess: metadata["sop_id"] = id_guess.group(1).upper()
+        metadata.update({"doc_id": None, "sop_id": None, "title": filename, "version": None, "effective_date": None, "owning_dept": None})
 
     return metadata
+
+def extract_clause_metadata(text: str, doc_info: Dict, section_name: str) -> Dict:
+    """
+    조항(Clause) 단위 상세 메타데이터 추출
+    """
+    # 🔥 너무 짧은 내용은 분석 스킵
+    clean_text = text.strip()
+    if len(clean_text) < 30:
+        return {}
+
+    # print(f"🧠 [Clause Scan] {section_name} 상세 분석 중...")
+    
+    prompt = f"""당신은 GMP 규정 지능형 분석가입니다. 다음 조항의 텍스트를 분석하여 구조화된 메타데이터를 생성하세요.
+
+[추출 필드]
+1. content_type: 목적, 정의, 책임, 절차, 기준, 기록, 기타 중 하나
+2. main_topic: 핵심 주제 (3~5단어)
+3. sub_topics: 세부 주제 리스트 (쉼표로 구분)
+4. actors: 관련 담당자나 역할 (쉼표 구분)
+5. actions: 수행해야 하는 행위나 절차 (쉼표 구분)
+6. conditions: 특수 조건이나 전제 상황
+7. summary: 30자 이내의 한 문장 요약
+8. intent_scope: 관리 영역 (예: user_account, training, document_lifecycle 등)
+9. intent_summary: 질문 의도 분석용 영어 요약문 (영어로 작성)
+10. language: ko 또는 en
+
+결과는 반드시 아래 JSON 형식으로만 답변하세요.
+{{
+  "content_type": "",
+  "main_topic": "",
+  "sub_topics": "",
+  "actors": "",
+  "actions": "",
+  "conditions": "",
+  "summary": "",
+  "intent_scope": "",
+  "intent_summary": "",
+  "language": "ko"
+}}
+
+[문서 정보: {doc_info.get('doc_id')} - {doc_info.get('title')}]
+[조항 제목: {section_name}]
+[주의사항]
+생각 과정(Reasoning)은 가능한 짧게 하거나 생략하고, 반드시 JSON 형식으로만 응답하세요.
+
+[조항 내용]
+{text[:2000]}"""
+
+    try:
+        llm_res = get_llm_response(prompt, max_tokens=4096, temperature=0.1)
+        json_match = re.search(r'(\{.*\})', llm_res, re.DOTALL)
+        if json_match:
+            res = json.loads(json_match.group(1))
+            # 🔥 호환성 보장
+            if 'doc_id' not in res and doc_info.get('doc_id'):
+                res['doc_id'] = doc_info.get('doc_id')
+            return res
+    except Exception as e:
+        print(f"⚠️ [Clause Scan] 실패: {e}")
+    
+    return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -277,6 +336,10 @@ def node_validate(state: PipelineState) -> PipelineState:
     3단계: 마크다운 품질 검증
     """
     markdown = state.get("markdown", "")
+    
+    # 🔥 [최적화] 변환이 완료되었으므로 대용량 바이너리 데이터는 삭제 (UI 속도 향상)
+    if markdown and "content" in state:
+        state["content"] = b"" # 메모리 및 UI 렌더링 부하 감소
     
     if not markdown:
         state["quality_score"] = 0.0
@@ -460,28 +523,64 @@ def node_split(state: PipelineState) -> PipelineState:
 
 def node_optimize(state: PipelineState) -> PipelineState:
     """
-    5단계: 긴 섹션 재분할 + 최적화된 메타데이터
+    5단계: 긴 섹션 재분할 + 상세 메타데이터 추출 + 최적화
     """
     sections = state.get("sections", [])
     chunk_size = state.get("chunk_size", 500)
     chunk_overlap = state.get("chunk_overlap", 50)
-    metadata = state.get("metadata", {})
+    doc_meta = state.get("metadata", {})
     
     chunks = []
     idx = 0
     
     # 🔥 문서 레벨 메타데이터
-    sop_id = metadata.get("sop_id")
-    doc_name = metadata.get("file_name")
-    version = metadata.get("version")
-    effective_date = metadata.get("effective_date")
+    doc_id = doc_meta.get("doc_id")
+    doc_title = doc_meta.get("title")
+    version = doc_meta.get("version")
     
+    # 1단계: 메타데이터 추출 및 조항 분석 (안정성을 위해 다시 순차 처리)
     for section in sections:
         content = section["content"]
         headers = section.get("headers", {})
-        header_path = section.get("header_path")
-        page = section.get("page", 1)
-        parent = section.get("parent")
+        clause_level = 0
+        for l in range(6, 0, -1):
+            if headers.get(f"H{l}"):
+                clause_level = l
+                break
+        
+        # 조항 번호 및 제목 추출
+        current_section_title = headers.get(f"H{clause_level}") or "Untitled"
+        clause_id = None
+        num_match = re.match(r'(\d+(?:\.\d+)*)', current_section_title)
+        if num_match:
+            clause_id = num_match.group(1)
+            
+        # 상위 섹션 번호 유추 (5.1.2 -> 5)
+        main_section = clause_id.split('.')[0] if clause_id and '.' in clause_id else clause_id
+        
+        # 섹션 정보 저장
+        section["main_section"] = main_section
+        section["clause_id"] = clause_id
+        section["current_title"] = current_section_title
+        section["clause_level"] = clause_level
+
+        # 🔥 조항별 상세 메타데이터 추출 (AI) - 순차 처리로 복구
+        # 제목이 있고, 조항 번호가 있으며, 본문이 100자 이상인 경우에만 분석
+        clause_meta = {}
+        if current_section_title != "Untitled" and clause_id and len(content.strip()) > 100:
+            print(f"   🔎 [{sections.index(section)+1}/{len(sections)}] 조항 분석 중: {current_section_title}")
+            clause_meta = extract_clause_metadata(content, doc_meta, current_section_title)
+        
+        section["clause_meta"] = clause_meta
+
+    # 2단계: 최적화 및 청크 생성
+    for section in sections:
+        content = section["content"]
+        clause_id = section.get("clause_id")
+        current_section_title = section.get("current_title")
+        clause_meta = section.get("clause_meta", {})
+        main_section = section.get("main_section")
+        clause_level = section.get("clause_level", 0)
         
         # 긴 섹션 재분할
         if len(content) > chunk_size:
@@ -492,47 +591,40 @@ def node_optimize(state: PipelineState) -> PipelineState:
             is_split = False
         
         for i, text in enumerate(text_chunks):
-            if not text.strip():
-                continue
+            if not text.strip(): continue
             
-            # 재분할된 청크에 컨텍스트 프리픽스 추가
-            if is_split and i > 0 and header_path:
-                text = f"[Context: {header_path}]\n\n{text}"
+            section_id = f"{doc_id}:{clause_id}" if clause_id else f"{doc_id}:CH{idx}"
             
-            # 🔥 조항 번호 추출 개선
-            section_num = None
-            current_section = headers.get("H4") or headers.get("H3") or headers.get("H2")
+            # 🔥 고도화된 메타데이터 구조 (V22.0)
+            meta = {
+                "doc_id": doc_id,
+                "doc_title": doc_title,
+                "clause_id": clause_id,
+                "title": current_section_title,
+                "clause_level": clause_level,
+                "main_section": main_section,
+                "section_id": section_id,
+                # LLM 분석 데이터
+                "content_type": clause_meta.get("content_type"),
+                "main_topic": clause_meta.get("main_topic"),
+                "sub_topics": clause_meta.get("sub_topics"),
+                "actors": clause_meta.get("actors"),
+                "actions": clause_meta.get("actions"),
+                "conditions": clause_meta.get("conditions"),
+                "summary": clause_meta.get("summary"),
+                "intent_scope": clause_meta.get("intent_scope"),
+                "intent_summary": clause_meta.get("intent_summary"),
+                "language": clause_meta.get("language", "ko"),
+                # 시스템 관리 정보
+                "page": section.get("page", 1),
+                "parent": section.get("parent"),
+                "chunk_part": i + 1 if is_split else None,
+            }
             
-            if current_section:
-                # 5.1.2.1, 5.1.1, 5.1, 5 패턴
-                num_match = re.match(r'^(\d+(?:\.\d+)*)', current_section)
-                if num_match:
-                    section_num = num_match.group(1)
-            
-            # 🔥 최적화된 메타데이터 (필수 + 유용한 것만)
             chunks.append({
                 "text": text.strip(),
                 "index": idx,
-                "metadata": {
-                    # 🔥 필수 (검색/필터링)
-                    "doc_name": doc_name,
-                    "sop_id": sop_id,
-                    "section_path": header_path,
-                    "section": current_section,
-                    
-                    # 🔥 유용 (출처/분석)
-                    "article_num": section_num,
-                    "page": page,
-                    "parent": parent,
-                    
-                    # 🔥 분할 청크 추적
-                    "chunk_part": i + 1 if is_split else None,
-                    "total_parts": len(text_chunks) if is_split else None,
-                    
-                    # 🔥 문서 버전 정보 (선택적)
-                    "version": version,
-                    "effective_date": effective_date,
-                }
+                "metadata": meta
             })
             idx += 1
     
@@ -633,13 +725,13 @@ def _convert_docx(filename: str, content: bytes) -> tuple:
                     break
             
             if not header_level:
-                if re.match(r'^\d+\.\d+\.\d+\.\d+\s*', text):
+                if re.match(r'^\d+\.\d+\.\d+\.\d+\s*', text) and len(text) < 60:
                     header_level = 5
-                elif re.match(r'^\d+\.\d+\.\d+\s+', text):
+                elif re.match(r'^\d+\.\d+\.\d+\s+', text) and len(text) < 60:
                     header_level = 4
-                elif re.match(r'^\d+\.\d+\s+', text):
+                elif re.match(r'^\d+\.\d+\s+', text) and len(text) < 60:
                     header_level = 3
-                elif re.match(r'^\d+\.?\s+[가-힣A-Za-z]', text):
+                elif re.match(r'^\d+\.?\s+[가-힣A-Za-z]', text) and len(text) < 60:
                     header_level = 2
                 elif re.match(r'^[가-힣A-Z][가-힣\s\(\)/·\-]+\s*\([A-Za-z\s&/\-:]+\)\s*$', text):
                     header_level = 3
@@ -664,15 +756,19 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
     try:
         import pdfplumber
         md_lines = []
+        total_text_len = 0
         with pdfplumber.open(BytesIO(content)) as pdf:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ''
                 if text.strip():
-                    # 🔥 페이지 마커 삽입
                     md_lines.append(f"<!-- PAGE:{i + 1} -->")
                     md_lines.append(text)
-        if md_lines:
+                    total_text_len += len(text.strip())
+        
+        # 🔥 실제 텍스트가 의미 있는 수준(예: 50자) 이상일 때만 성공으로 간주
+        if total_text_len > 50:
             return '\n'.join(md_lines), {"parser": "pdfplumber", "total_pages": len(pdf.pages)}, "pdfplumber"
+        print(f"   ⚠️ pdfplumber: 텍스트 추출 부족 ({total_text_len}자). 다른 파서 시도...")
     except Exception as e:
         print(f"   pdfplumber 실패: {e}")
     
@@ -690,7 +786,9 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
             converter = DocumentConverter()
             result = converter.convert(temp_path)
             markdown = result.document.export_to_markdown()
-            return markdown, {"parser": "docling"}, "docling"
+            if len(markdown.strip()) > 50:
+                return markdown, {"parser": "docling"}, "docling"
+            print(f"   ⚠️ Docling: 텍스트 추출 부족. 다른 파서 시도...")
         finally:
             os.unlink(temp_path)
     except Exception as e:
@@ -701,12 +799,16 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
         import fitz
         pdf = fitz.open(stream=content, filetype="pdf")
         md_lines = []
+        total_text_len = 0
         for page_num, page in enumerate(pdf):
             text = page.get_text()
             if text.strip():
                 md_lines.append(f"<!-- PAGE:{page_num + 1} -->")
                 md_lines.append(text)
-        return '\n'.join(md_lines), {"parser": "pymupdf", "total_pages": len(pdf)}, "pymupdf"
+                total_text_len += len(text.strip())
+        if total_text_len > 50:
+            return '\n'.join(md_lines), {"parser": "pymupdf", "total_pages": len(pdf)}, "pymupdf"
+        print(f"   ⚠️ PyMuPDF: 텍스트 추출 부족 ({total_text_len}자). 다른 파서 시도...")
     except Exception as e:
         print(f"   PyMuPDF 실패: {e}")
     
@@ -715,16 +817,53 @@ def _convert_pdf_with_fallback(filename: str, content: bytes) -> tuple:
         from PyPDF2 import PdfReader
         reader = PdfReader(BytesIO(content))
         md_lines = []
+        total_text_len = 0
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ''
             if text.strip():
                 md_lines.append(f"<!-- PAGE:{i + 1} -->")
                 md_lines.append(text)
-        return '\n'.join(md_lines), {"parser": "pypdf2", "total_pages": len(reader.pages)}, "pypdf2"
+                total_text_len += len(text.strip())
+        if total_text_len > 50:
+            return '\n'.join(md_lines), {"parser": "pypdf2", "total_pages": len(reader.pages)}, "pypdf2"
+        print(f"   ⚠️ PyPDF2: 텍스트 추출 부족 ({total_text_len}자). 다른 파서 시도...")
     except Exception as e:
         print(f"   PyPDF2 실패: {e}")
     
-    raise Exception("모든 PDF 파서 실패")
+    # 5순위: 🔥 OCR Fallback (스캔본/이미지 PDF용)
+    try:
+        print("   🔍 스캔 문서 감지: OCR(광학 문자 인식) 엔진 가동 중...")
+        markdown, metadata = _convert_pdf_ocr(content)
+        if len(markdown.strip()) > 50:
+            return markdown, {**metadata, "parser": "ocr"}, "ocr"
+    except Exception as e:
+        print(f"   OCR 파서 실패: {e}")
+    
+    raise Exception("모든 PDF 파서 실패 (OCR 포함)")
+
+def _convert_pdf_ocr(content: bytes) -> tuple:
+    """PDF OCR 처리 (Tesseract 기반)"""
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+        from PIL import Image
+        
+        # PDF를 이미지로 변환 (300 DPI 권장)
+        pages = convert_from_bytes(content, dpi=300)
+        
+        md_lines = []
+        for i, page in enumerate(pages):
+            # 한글 + 영어 OCR 수행
+            text = pytesseract.image_to_string(page, lang='kor+eng')
+            if text.strip():
+                md_lines.append(f"<!-- PAGE:{i + 1} (OCR) -->")
+                md_lines.append(text)
+        
+        return '\n'.join(md_lines), {"total_pages": len(pages)}
+    except ImportError:
+        return "OCR 필요한 라이브러리(pytesseract, pdf2image)가 설치되지 않았습니다.", {}
+    except Exception as e:
+        return f"OCR 처리 중 오류 발생: {str(e)}", {}
 
 
 def _convert_html(filename: str, content: bytes) -> tuple:
@@ -855,18 +994,18 @@ def _infer_headers(markdown: str) -> str:
             continue
         
         # 1. 숫자형 헤더 패턴
-        # 5.1.2.1 xxx → H5
-        if re.match(r'^(\d+\.\d+\.\d+\.\d+)\s*(.+)', stripped):
+        # 5.1.2.1 xxx → H5 (글자 수 제한 강화: 40자)
+        if re.match(r'^(\d+\.\d+\.\d+\.\d+)\s*(.+)', stripped) and len(stripped) < 40:
             result.append(f"##### {stripped}")
             continue
         
         # 5.1.1 xxx → H4
-        if re.match(r'^(\d+\.\d+\.\d+)\s+(.+)', stripped):
+        if re.match(r'^(\d+\.\d+\.\d+)\s+(.+)', stripped) and len(stripped) < 40:
             result.append(f"#### {stripped}")
             continue
         
-        # 5.1 xxx → H3
-        if re.match(r'^(\d+\.\d+)\s+(.+)', stripped):
+        # 5.1 xxx → H3 (글자 수 제한 강화: 40자)
+        if re.match(r'^(\d+\.\d+)\s+(.+)', stripped) and len(stripped) < 40:
             result.append(f"### {stripped}")
             continue
         
@@ -875,7 +1014,7 @@ def _infer_headers(markdown: str) -> str:
         if match:
             num = match.group(1)
             text = match.group(2)
-            if not re.match(r'^of\s+\d+', text, re.IGNORECASE):
+            if not re.match(r'^of\s+\d+', text, re.IGNORECASE) and len(stripped) < 40:
                 result.append(f"## {stripped}")
                 continue
         

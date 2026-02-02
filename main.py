@@ -312,14 +312,24 @@ async def upload_document(
             
             # 메타데이터 보강
             metadata_base = result.get("metadata", {})
-            sop_id = metadata_base.get("sop_id")
+            sop_id = metadata_base.get("doc_id") or metadata_base.get("sop_id")
+            
+            # 🔥 ID가 없으면 파일명에서 끝자리 숫자로라도 유추 시도
+            if not sop_id:
+                import re
+                id_match = re.search(r'([A-Z0-9]+-[A-Z0-9]+-\d+)', filename)
+                if id_match:
+                    sop_id = id_match.group(1)
+                else:
+                    sop_id = filename.split('.')[0] # 최후의 수단: 파일명
+            
             # 제목 설정: 원본 파일명 유지 (사용자 요청)
             doc_title = filename 
             extracted_title = metadata_base.get("title")
             if extracted_title and extracted_title not in filename:
                 doc_title = f"{filename} ({extracted_title})"
             
-            print(f"   SOP ID: {sop_id}")
+            print(f"   DOC ID: {sop_id}")
             print(f"   제목: {doc_title}")
             print(f"   품질 점수: {result.get('quality_score', 0):.0%}")
             print(f"   변환 방법: {result.get('conversion_method')}")
@@ -417,9 +427,10 @@ async def upload_document(
                 markdown_content=full_markdown,
                 pdf_binary=content if filename.lower().endswith(".pdf") else None,
                 doc_metadata={
+                    "doc_id": metadata_base.get("doc_id"),
                     "version": metadata_base.get("version"),
                     "effective_date": metadata_base.get("effective_date"),
-                    "department": metadata_base.get("department"),
+                    "owning_dept": metadata_base.get("owning_dept"),
                     "filename": filename
                 }
             )
@@ -479,87 +490,95 @@ async def upload_document(
 
 
 def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
-    """LangGraph 파이프라인 결과를 Neo4j에 업로드"""
+    """LangGraph 파이프라인 결과를 Neo4j에 업로드 (V22.0 대응)"""
     metadata = result.get("metadata", {})
-    sop_id = metadata.get("sop_id") or "UNKNOWN"
+    doc_id = metadata.get("doc_id") or "UNKNOWN"
     title = metadata.get("title") or filename
     version = metadata.get("version") or "1.0"
+    effective_date = metadata.get("effective_date")
+    owning_dept = metadata.get("owning_dept")
     
-    # Document 노드 생성
+    # 1. Document 노드 생성
     graph.create_document(
-        sop_id=sop_id,
+        doc_id=doc_id,
         title=title,
         version=version,
-        doc_type="SOP",
+        effective_date=effective_date,
+        owning_dept=owning_dept,
         metadata=metadata
     )
     
-    # Section 노드 생성 (sections에서)
+    # 2. DocumentType 처리 (코드 기반)
+    doc_type_code = "SOP" # 기본값
+    if "SOP" in doc_id: doc_type_code = "SOP"
+    elif "WI" in doc_id: doc_type_code = "WI"
+    
+    graph.create_document_type(doc_type_code, "표준작업절차서" if doc_type_code == "SOP" else "작업지침서", doc_type_code)
+    graph.link_doc_to_type(doc_id, doc_type_code)
+    
+    # 3. Section 노드 생성 및 관계 설정
     sections = result.get("sections", [])
-    section_stack = {}
     
     for sec in sections:
         headers = sec.get("headers", {})
         content = sec.get("content", "")
         page = sec.get("page", 1)
-        parent = sec.get("parent")
-        header_path = sec.get("header_path")
+        parent_name = sec.get("parent")
+        clause_meta = sec.get("clause_meta", {})
         
-        # section_id 결정
-        section_id = None
-        section_name = ""
-        section_type = "section"
-        
-        for level in [4, 3, 2, 1]:
-            h_key = f"H{level}"
-            if headers.get(h_key):
-                section_name = headers[h_key]
-                # 숫자 추출
-                import re
-                num_match = re.match(r'^(\d+(?:\.\d+)*)', section_name)
-                if num_match:
-                    section_id = num_match.group(1)
-                else:
-                    section_id = section_name[:20]
-                
-                if level == 2:
-                    section_type = "section"
-                elif level == 3:
-                    section_type = "subsection"
-                elif level == 4:
-                    section_type = "subsubsection"
+        # clause_level 및 section_id 유추
+        clause_level = 0
+        current_title = ""
+        for level in range(6, 0, -1):
+            if headers.get(f"H{level}"):
+                clause_level = level
+                current_title = headers[f"H{level}"]
                 break
         
-        if not section_id:
-            continue
+        clause_id = None
+        import re
+        num_match = re.match(r'^(\d+(?:\.\d+)*)', current_title)
+        if num_match:
+            clause_id = num_match.group(1)
         
-        # Section 노드 생성
+        if not clause_id: continue
+        
+        section_id = f"{doc_id}:{clause_id}"
+        main_section = clause_id.split('.')[0] if '.' in clause_id else clause_id
+        
+        # Section 노드 생성 (상세 메타데이터 포함)
         graph.create_section(
-            sop_id=sop_id,
-            section_id=str(section_id),
-            name=section_name,
-            section_type=section_type,
-            content=content[:5000],
-            section_path=header_path,
+            doc_id=doc_id,
+            section_id=section_id,
+            title=current_title,
+            content=content,
+            clause_level=clause_level,
+            main_section=main_section,
+            llm_meta=clause_meta,
             page=page
         )
         
-        # 계층 관계 (간단 버전)
-        if section_type == "subsection" and section_stack.get("section"):
-            graph.create_section_hierarchy(
-                sop_id=sop_id,
-                parent_section_id=section_stack["section"],
-                child_section_id=str(section_id)
-            )
-        elif section_type == "subsubsection" and section_stack.get("subsection"):
-            graph.create_section_hierarchy(
-                sop_id=sop_id,
-                parent_section_id=section_stack["subsection"],
-                child_section_id=str(section_id)
-            )
+        # 4. 계층 관계 (Parent-Child)
+        if parent_name:
+            # 부모 ID 유추 (단순화: 같은 문서 내에서 점 하나 뺀 패턴)
+            if '.' in clause_id:
+                parent_clause_id = '.'.join(clause_id.split('.')[:-1])
+                parent_section_id = f"{doc_id}:{parent_clause_id}"
+                graph.create_section_hierarchy(parent_section_id, section_id)
         
-        # 스택 업데이트
-        section_stack[section_type] = str(section_id)
+        # 5. Concept 연동 (intent_scope 활용)
+        intent_scope = clause_meta.get("intent_scope")
+        if intent_scope:
+            graph.create_concept(intent_scope, intent_scope, intent_scope)
+            graph.link_section_to_concept(section_id, intent_scope)
+            
+        # 6. 타 문서 언급 (MENTIONS) 추적
+        mentions = re.findall(r'((?:EQ-)?SOP[-_]?\d{4,5})', content, re.IGNORECASE)
+        for m in set(mentions):
+            m_id = m.upper().replace('_', '-')
+            if not m_id.startswith('EQ-'): m_id = 'EQ-' + m_id
+            if m_id != doc_id:
+                graph.link_section_to_mention_doc(section_id, m_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

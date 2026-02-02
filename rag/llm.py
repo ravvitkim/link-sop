@@ -3,8 +3,11 @@ LLM 모듈 v7.0 - Z.AI + Ollama + HuggingFace
 """
 
 import os
+import re
 import torch
 import requests
+import time
+import random
 from typing import Dict, List, Optional, Any
 
 
@@ -41,7 +44,7 @@ class ZaiLLM:
         temperature: float = 0.7,
         max_tokens: int = 2048  # 🔥 기본 토큰 상향
     ) -> str:
-        """텍스트 생성"""
+        """Z.AI API를 사용하여 응답 생성 (재시도 로직 포함)"""
         # API 키 확인
         if not self.api_key or "your-api-key" in self.api_key:
             print("⚠️ ZAI_API_KEY가 설정되지 않았거나 기본값입니다. .env 파일을 확인하세요.")
@@ -49,44 +52,67 @@ class ZaiLLM:
 
         client = self._get_client()
         
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        max_retries = 3
+        base_delay = 2  # 초
         
-        try:
-            print(f"🚀 Z.AI API 호출 중... (모델: {self.model}, MaxTokens: {max_tokens})")
-            
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            
-            if not response.choices:
-                print(f"⚠️ Z.AI 응답에 choices가 없습니다: {response}")
-                return "❌ 오류: Z.AI로부터 적절한 응답을 받지 못했습니다."
+        for attempt in range(max_retries):
+            try:
+                messages = []
+                if system:
+                    messages.append({"role": "system", "content": system})
+                messages.append({"role": "user", "content": prompt})
+
+                print(f"🚀 Z.AI API 호출 중... (모델: {self.model}, MaxTokens: {max_tokens}, 시도: {attempt+1})")
                 
-            msg_obj = response.choices[0].message
-            content = getattr(msg_obj, 'content', "") or ""
-            reasoning = getattr(msg_obj, 'reasoning_content', "") or ""
-            
-            if reasoning:
-                print(f"🧠 모델의 생각(Reasoning) 추출됨 ({len(reasoning)}자)")
-            
-            # 본문(content)이 비어있는데 reasoning_content만 있는 경우
-            if not content and reasoning:
-                print("⚠️ 본문이 비어있어 생각(Reasoning) 추출됨 (답변으로 노출하지 않음)")
-                content = "❌ 답변 생성 중 토큰 한도에 도달하여 정답을 출력하지 못했습니다. 질문을 더 구체적으로 하거나 토큰 설정을 더 높여주세요."
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
                 
-            print(f"✅ Z.AI 응답 수신 성공 (길이: {len(content)})")
-            return content
-        except Exception as e:
-            print(f"❌ Z.AI 호출 오류: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"❌ Z.AI 호출 중 오류가 발생했습니다: {str(e)}"
+                if not response.choices:
+                    print(f"⚠️ Z.AI 응답에 choices가 없습니다: {response}")
+                    return "❌ 오류: Z.AI로부터 적절한 응답을 받지 못했습니다."
+                    
+                msg_obj = response.choices[0].message
+                content = getattr(msg_obj, 'content', "") or ""
+                reasoning = getattr(msg_obj, 'reasoning_content', "") or ""
+                
+                # 본문(content)이 비어있는데 reasoning_content만 있는 경우
+                if not content and reasoning:
+                    # 🔥 방법 1: 완전한 JSON 블록 찾기 ({ ... })
+                    json_match = re.search(r'(\{.*\})', reasoning, re.DOTALL)
+                    if json_match:
+                        content = json_match.group(1)
+                        print(f"✅ [Recall] Reasoning에서 완전한 JSON 복구 ({len(content)}자)")
+                    else:
+                        # 🔥 방법 2: 잘린 JSON이라도 시작 부분이라도 찾기
+                        start_idx = reasoning.find('{')
+                        if start_idx != -1:
+                            content = reasoning[start_idx:]
+                            if not content.strip().endswith('}'):
+                                content = content.strip() + '"}'
+                            print(f"⚠️ [Recall] 잘린 JSON 강제 복구 시도")
+                        else:
+                            content = "❌ 답변 생성 중 토큰 한도에 도달했습니다."
+                
+                return content
+
+            except Exception as e:
+                error_msg = str(e)
+                # 할당량 초과(429) 또는 높은 동시성 오류(1302) 시 재시도
+                if "429" in error_msg or "1302" in error_msg or "Rate limit" in error_msg or "too many" in error_msg.lower():
+                    # 지수 백오프 + 지터 (서버 부하 분산)
+                    delay = (base_delay * (2 ** attempt)) + random.uniform(1, 3)
+                    print(f"⚠️ API 한도 초과/과부하 감지. {delay:.1f}초 후 자동 재시도... ({attempt+1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print(f"❌ Z.AI 호출 오류: {e}")
+                    return f"❌ AI 호출 오류: {str(e)}"
+        
+        return "❌ 오류: 여러 번의 재시도 후에도 AI 응답을 받지 못했습니다. (API 할당량 초과)"
 
     def generate_stream(
         self,

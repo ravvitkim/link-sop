@@ -225,6 +225,7 @@ class AgentState(TypedDict):
     reasoning: str
     queries: List[str]
     keywords: List[str]
+    is_verification: bool # 추가: 검증 성격 질문 여부
     # 🔥 ReAct 루프를 위한 메시지 기록 추가
     messages: Annotated[List[Any], operator.add]
 
@@ -289,10 +290,13 @@ def reasoner_node(state: AgentState):
     print(f"⚖️ [Reasoner] 사고 중... (Message Count: {len(state['messages'])})")
     
     # 질문 성격에 따른 시스템 프롬프트 선택
-    is_verification = any(kw in state['query'] for kw in ["되나요", "가능한가요", "위반", "적절", "판단", "규정", "허용", "금지"])
+    is_verification = any(kw in state['query'] for kw in ["되나요", "가능한가요", "위반", "적절", "판단", "허용", "금지", "적합"])
     instructions = VERIFICATION_INSTRUCTIONS if is_verification else INFO_INSTRUCTIONS
     
     system_prompt = f"{BASE_SYSTEM_PROMPT}\n{instructions}"
+    
+    # 상태 업데이트용 사전 정보
+    state_update = {"is_verification": is_verification}
     
     # 도구 정의 전달 (LLM이 도구 사용 여부 결정)
     tools = [
@@ -344,6 +348,7 @@ def reasoner_node(state: AgentState):
         
         # 최종 답변인 경우
         return {
+            **state_update,
             "messages": [msg],
             "answer": msg.content or "",
             "reasoning": getattr(msg, 'reasoning_content', "")
@@ -390,15 +395,31 @@ def verifier_node(state: AgentState):
     """최종 규정 검증 및 무결성 체크 노드"""
     print(f"⚖️ [Verifier] 최종 규정 적합성 판단 및 검증 중")
     
-    # 그동안 수집된 모든 메시지를 바탕으로 최종 검증 수행
-    # 시스템 프롬프트를 검증 모드로 다시 강조
-    verification_prompt = """당신은 품질보증(QA) 부서의 최종 승인권자입니다. 
-에이전트가 앞서 수집한 규정 데이터들을 바탕으로 다음 사항을 최종 점검하세요:
-1. **상충 여부**: 수집된 여러 SOP 간에 서로 모순되는 지침이 있는지 확인하세요.
-2. **누락 여부**: 질문에 핵심적인 답변을 제공하기에 근거 데이터가 충분한지 판단하세요.
-3. **규정 준수**: 답변이 GMP 규정의 취지를 훼손하지 않는지 검토하세요.
+    # 시스템 프롬프트 개편: 정답 우선 원칙
+    is_v = state.get("is_verification", False)
+    
+    if is_v:
+        # 검증 모드: 심층 보고서 + 정답
+        verification_prompt = f"""당신은 품질보증(QA) 부서의 최종 승인권자입니다. 
+사용자의 질문에 대해 규정 근거를 바탕으로 **적합성 판정 및 최종 답변**을 작성하세요.
 
-만약 데이터가 부족하거나 상충된다면 그 사실을 명시하고, 가능한 범위 내에서 최선의 권고안을 제시하세요."""
+## 🎯 답변 작성 가이드 (검증 모드)
+1. **결론 (Conclusion)**: 질문에 대한 적합성 여부(예: 허용/금지/위반 등)를 최상단에 명확히 기재하세요.
+2. **상세 근거**: 검색된 SOP의 조항들을 인용하여 왜 그런 결론이 나왔는지 논리적으로 설명하세요.
+3. **QA 검토 보고서**: 답변 하단에 [상충/누락/준수] 여부를 포함한 보고서 섹션을 구성하세요.
+
+사용자 질문: {state.get('query')}"""
+    else:
+        # 정보 검색 모드: 정답 중심 + 최소한의 검증
+        verification_prompt = f"""당신은 GMP 규정(SOP) 안내 전문가입니다. 
+사용자가 찾는 정보를 검색된 데이터에서 추출하여 **친절하고 정확하게** 답변하세요.
+
+## 🎯 답변 작성 가이드 (정보 검색 모드)
+1. **직접적인 정답**: 사용자가 묻는 정보(예: 특정 조항의 내용, 문서 번호 등)를 가장 먼저, 명확하게 답변하세요. 
+2. **불필요한 형식 지양**: "QA 검토 결과"와 같은 딱딱한 보고서 형식을 최상단에 두지 마세요. 
+3. **근거 표기**: 답변 내용 끝에 출처(조항 번호)만 짧게 덧붙이세요.
+
+사용자 질문: {state.get('query')}"""
 
     messages = [{"role": "system", "content": verification_prompt}] + state["messages"]
     
@@ -452,7 +473,9 @@ def create_workflow():
         should_continue,
         {
             "tools": "tools",
-            END: "verifier" # 루프 종료 시 바로 END로 가지 않고 검증 단계를 거침
+            # 단순 정보 검색인 경우 검증 노드를 건너뛰거나 바로 엔드로 갈 수도 있지만,
+            # 현재는 모든 최종 답변의 품질을 위해 verifier를 거치되 프롬프트로 제어함
+            END: "verifier" 
         }
     )
     workflow.add_edge("tools", "reasoner")
